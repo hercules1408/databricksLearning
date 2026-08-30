@@ -47,13 +47,16 @@ SELECT /*+ BROADCAST(t) */ ...   -- or MERGE(a,b) / SHUFFLE_HASH(a,b)
 - **Bucketing:** `df.write.bucketBy(n, "key").sortBy("key")` — pre-shuffles at write time so repeated joins on that key skip the shuffle. Fixed bucket count; superseded by Liquid Clustering for most new tables.
 - **`mapPartitions`/`foreachPartition`:** run once **per partition** (not per row) — use for expensive setup (DB connections, model loading).
 - **Higher-order array functions** (no UDF needed): `F.transform`, `F.filter`, `F.aggregate`, `F.exists`, `F.forall`.
+- **Reading a plan (`.explain("formatted")`):** `*` prefix = Whole-Stage Code Gen active. `Exchange` = a shuffle (look here first for cost). `BroadcastExchange`/`BroadcastHashJoin` = one side broadcast, no shuffle. `SortMergeJoin` = both sides shuffled+sorted. `HashAggregate` (x2) = partial + final aggregation. `ColumnarToRow`/frequent Photon-node absence = query falling out of Photon. `PushedFilters` in a Scan = confirms pushdown reached the file scan.
 
 ---
 
 ## 2. Delta Lake
 
-- **`_delta_log`**: JSON commit files (`0000N.json`) + checkpoint Parquet every 10 commits + CRC stats.
+- **`_delta_log`**: JSON commit files (`0000N.json`) + checkpoint Parquet every 10 commits + CRC stats. `delta.checkpointInterval` tunable for high commit-frequency tables.
 - **OCC (Optimistic Concurrency Control):** writer commits a new version; conflicts auto-retry if non-overlapping. Isolation: `WriteSerializable` (default, more concurrency) vs `Serializable` (strict).
+- **Conflict matrix:** two appends → no conflict. Append + `OPTIMIZE` → no conflict. Two UPDATE/DELETE/MERGE on **disjoint** files → no conflict, auto-retry. Same files → **conflict, one fails**. `OPTIMIZE` + concurrent UPDATE/DELETE on same files → conflict.
+- **No multi-table transactions** — Delta transactions are single-table only; cross-table consistency must be engineered at the orchestration level.
 
 ```sql
 OPTIMIZE my_table ZORDER BY (customer_id);      -- compact small files (~1GB target)
@@ -146,9 +149,14 @@ COPY INTO t FROM 's3://bucket/raw/' FILEFORMAT = JSON FORMAT_OPTIONS ('mergeSche
 - **Output modes:** Append (no updates to past output) / Update (changed rows only) / Complete (full result every trigger, aggregations only).
 - **Trigger types:** `processingTime`, `availableNow` (process all then stop — good for scheduled jobs; **replaces deprecated `trigger(once=True)`**), `continuous`.
 - **Checkpoint dir** stores offsets/commits/state — enables exact recovery.
+- **Stream-static join:** re-reads static side fresh each micro-batch, no state needed. **Stream-stream join:** requires watermark on **both** sides + a time-range join condition, or state grows unbounded.
+- **`mapGroupsWithState`/`flatMapGroupsWithState`:** custom per-key state machines beyond windowed aggregations (sessions, dedup, custom logic). `flatMap` variant allows 0-many outputs per group.
+- **Idempotent append writes:** `.option("txnAppId", app_id).option("txnVersion", batch_id)` — Delta auto-skips a duplicate `(appId, version)` write, simpler than `MERGE` for pure appends.
+- **Monitoring:** `query.status` / `query.lastProgress` / `query.recentProgress` (rows/sec, batch duration); `StreamingQueryListener` for event-driven alerting (onQueryStarted/Progress/Terminated).
 
 **DLT:**
 - **Pipeline modes:** Triggered (run once, process available data, stop — cheaper) vs Continuous (cluster stays up, lowest latency, higher cost).
+- **`dlt.apply_changes` (`APPLY CHANGES INTO`):** declarative CDC — replaces hand-written MERGE for SCD1/2 inside DLT. `keys`, `sequence_by`, `apply_as_deletes`, `stored_as_scd_type=1|2`.
 ```python
 @dlt.table
 @dlt.expect("valid_amount", "amount > 0")            # track & warn
@@ -234,8 +242,8 @@ with mlflow.start_run():
 client.transition_model_version_stage(name="m", version=3, stage="Production")
 model = mlflow.pyfunc.load_model("models:/m/Production")
 ```
-- **Feature Store:** define features once (`FeatureLookup`), reuse identically in training + serving — avoids train/serve skew.
-- **Model Serving:** managed REST endpoints, scale-to-zero.
+- **Feature Store:** define features once (`FeatureLookup`), reuse identically in training + serving — avoids train/serve skew. **Offline store** = Delta table (training/batch). **Online store** = low-latency KV store (DynamoDB/Cosmos, via `publish_table`) for real-time serving lookups.
+- **Model Serving:** managed REST endpoints, scale-to-zero. **Traffic splitting** across model versions (`traffic_config` with `traffic_percentage` per served entity) enables A/B testing & canary rollouts on one endpoint.
 - **Vector Search:** `create_delta_sync_index` — auto-synced embedding index for RAG; typical flow: Delta text chunks → embeddings → Vector Search → LLM context.
 - **DBSQL:** Classic/Serverless/Pro Warehouses, Photon-accelerated. **Genie** = NL-to-SQL over governed UC tables.
 - **Lakehouse Federation:** query external DBs (Postgres, Snowflake, etc.) live through UC, no ETL copy — `CREATE CONNECTION` / `CREATE FOREIGN CATALOG`.
@@ -282,6 +290,8 @@ F.sum("x").over(w2)   # running total
 **Array (higher-order, no UDF):** `F.transform`, `F.filter`, `F.aggregate`, `F.exists`, `F.forall`; `F.explode`, `F.posexplode`
 
 **Schema:** `StructType([StructField(...)])`, `.printSchema()`, `.selectExpr()`
+
+**Keys/Hashing/Sampling:** `F.monotonically_increasing_id()` (unique, NOT gapless/sequential), `F.sha2(concat_ws("|",...), 256)` / `F.md5()` (deterministic surrogate keys), `F.sequence(start, stop, interval)` (date spines), `F.arrays_zip()`, `.sample(fraction, seed)`, `.sampleBy("col", fractions, seed)` (stratified), `.randomSplit([0.8, 0.2], seed)` (train/test)
 
 **RDD:** `.map/.filter/.flatMap/.reduce/.foreach/.foreachPartition/.mapPartitions`, `.reduceByKey/.groupByKey`
 

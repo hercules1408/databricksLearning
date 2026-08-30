@@ -156,6 +156,43 @@ spark.conf.set("spark.sql.cbo.joinReorder.enabled", "true")   # reorder multi-wa
 
 ---
 
+### 1.4b Reading a Physical Query Plan
+
+Being able to actually *read* `.explain()` output is a distinct skill from knowing the concepts — a very common practical interview ask is "look at this plan and tell me what's wrong."
+
+```python
+df1.join(df2, "id").filter(F.col("amount") > 100).explain("formatted")
+```
+
+```
+== Physical Plan ==
+* Project (7)
++- * BroadcastHashJoin Inner BuildRight (6)
+   :- * Filter (2)
+   :  +- * ColumnarToRow (1)
+   :     +- Scan parquet fact_sales (0)
+   +- BroadcastExchange (5)
+      +- * Filter (4)
+         +- * ColumnarToRow (3)
+            +- Scan parquet dim_store (0)
+```
+
+| Symbol / Node | Meaning |
+|---|---|
+| `*` prefix (e.g., `*Project`, `*Filter`) | This operator is running under **Whole-Stage Code Gen** — fused into one generated function, no per-row virtual call overhead |
+| `Exchange` | A **shuffle** is happening here — the single most expensive thing to look for in a plan |
+| `BroadcastExchange` | The broadcast side of a `BroadcastHashJoin` — data is being sent to every executor |
+| `SortMergeJoin` | Both join sides were shuffled and sorted — expect an `Exchange` on both branches feeding into it |
+| `BroadcastHashJoin` | One side was broadcast — no `Exchange`/shuffle on that side |
+| `HashAggregate` (appears twice) | Partial aggregation (pre-shuffle, reduces data volume) followed by final aggregation (post-shuffle) — this pairing is what makes `groupBy` aggregations efficient despite the shuffle |
+| `ColumnarToRow` / `RowToColumnar` | A conversion between Photon's columnar batch format and Spark's row format — frequent occurrences of this can indicate a query is falling in and out of Photon acceleration |
+| `PushedFilters` (in a Scan node's details) | Confirms predicate pushdown actually reached the file scan — if a filter you expect isn't listed here, it isn't being pushed down |
+| `Photon...` prefixed nodes (e.g., `PhotonScan`) | That operator executed via the Photon engine (Module 1.10) instead of the JVM engine |
+
+**Interview answer:** *"The first thing I look for in any plan is the number and position of `Exchange` nodes — every one is a shuffle, and shuffles are almost always the most expensive part of a query. Then I check whether joins are `BroadcastHashJoin` (cheap, no shuffle on the small side) or `SortMergeJoin` (both sides shuffled) and whether that matches what I'd expect given the table sizes — a `SortMergeJoin` on a table I know is small usually means stale statistics or a broadcast threshold that's too conservative."*
+
+---
+
 ### 1.5 Project Tungsten Engine
 
 - **Off-heap memory** via `sun.misc.Unsafe`: Spark manages its own binary memory layout outside the JVM heap, avoiding GC overhead and object header waste.
@@ -566,6 +603,24 @@ ALTER TABLE my_table SET TBLPROPERTIES (
 ```python
 # Conflict example: two concurrent MERGE operations on overlapping partitions
 # will cause one to fail with a ConcurrentAppendException and retry
+```
+
+**What actually conflicts vs auto-retries — the concrete matrix interviewers probe for:**
+
+| Concurrent Operations | Conflict? | Why |
+|---|---|---|
+| Two `INSERT`/append operations | **No conflict** | Appends only add new files; they don't touch each other's data |
+| `INSERT` + `OPTIMIZE` | **No conflict** | `OPTIMIZE` only rewrites existing files into new ones; it doesn't touch rows an append is adding |
+| Two `UPDATE`/`DELETE`/`MERGE` touching **disjoint** partitions/files | **No conflict, auto-retries** | Delta detects the file sets don't overlap and safely rebases |
+| Two `UPDATE`/`DELETE`/`MERGE` touching the **same** files | **Conflict — one fails** | Both tried to rewrite the same physical file version; the second committer must retry from scratch (Delta does not merge the two edits automatically) |
+| `OPTIMIZE` + a concurrent `UPDATE`/`DELETE` on the same files | **Conflict** | `OPTIMIZE` rewrote files that the other operation also expected to modify |
+
+**Important limitation — no multi-table transactions:** Delta Lake transactions are **scoped to a single table**. There is no way to atomically commit changes across two different Delta tables in one transaction — a very common system-design "gotcha" question. If a workflow needs table A and table B to stay consistent with each other, that consistency has to be engineered at the application/orchestration level (e.g., a Workflow task that only proceeds to write table B after table A's write is confirmed committed), not via a single atomic Delta transaction spanning both.
+
+**Checkpoint interval:** controls how often Delta writes a compacted checkpoint of the transaction log (default every 10 commits) — tune it if you have very high commit frequency (e.g., continuous streaming micro-batches) and want to reduce how many JSON log files a reader has to replay.
+
+```sql
+ALTER TABLE my_table SET TBLPROPERTIES ('delta.checkpointInterval' = '20');
 ```
 
 ---
@@ -1095,6 +1150,72 @@ agg.writeStream.outputMode("update").format("delta") \
 - **State Store backends**: default in-memory/HDFS-backed store vs **RocksDB StateStore** (recommended for large stateful streams — better memory efficiency, spills to local disk).
 - **Output modes**: `Append` (only final rows, no updates to previous output), `Update` (only changed rows), `Complete` (entire result table every trigger — only for aggregations).
 
+**Stream-Static and Stream-Stream Joins**
+
+```python
+# Stream-static join - the common case (enrich streaming events with a slowly-changing dimension)
+static_dim = spark.read.table("dim_device")   # a regular batch DataFrame, re-read fresh each micro-batch
+enriched = events.join(static_dim, "device_id")   # inner/left only - right/full outer not supported here
+
+# Stream-stream join - REQUIRES a watermark on BOTH sides, or state grows unbounded forever
+orders = spark.readStream.table("orders_stream").withWatermark("order_time", "1 hour")
+payments = spark.readStream.table("payments_stream").withWatermark("payment_time", "2 hours")
+
+joined = orders.join(
+    payments,
+    F.expr("""
+        orders.order_id = payments.order_id AND
+        payments.payment_time BETWEEN orders.order_time AND orders.order_time + INTERVAL 2 HOURS
+    """)
+)
+```
+**Interview answer:** *"A stream-static join re-reads the static side fresh on every micro-batch (no state needed on that side). A stream-stream join is fundamentally different — Spark has to buffer rows from **both** streams waiting for a match, so without watermarks on both sides that buffered state grows forever. The watermark plus the time-range join condition together tell Spark exactly how long to keep a buffered row around before giving up on finding its match."*
+
+**Arbitrary Stateful Processing (`mapGroupsWithState`)**
+
+For custom stateful logic beyond what windowed aggregations offer (e.g., tracking a custom session or a multi-event state machine per key):
+
+```python
+from pyspark.sql.streaming.state import GroupState, GroupStateTimeout
+from typing import Iterator
+
+def update_session_state(key, values: Iterator, state: GroupState):
+    if state.hasTimedOut:
+        session_summary = state.get
+        state.remove()
+        return iter([(key, session_summary, "EXPIRED")])
+
+    current = state.getOption if state.exists else 0
+    new_total = (state.get if state.exists else 0) + sum(v.amount for v in values)
+    state.update(new_total)
+    state.setTimeoutDuration("30 minutes")   # session times out after 30 min of inactivity
+    return iter([(key, new_total, "ACTIVE")])
+
+result = (events.groupByKey(lambda row: row.session_id)
+          .mapGroupsWithState(update_session_state,
+                               timeoutConf=GroupStateTimeout.ProcessingTimeTimeout))
+```
+- `mapGroupsWithState` returns exactly one row per group per trigger; `flatMapGroupsWithState` allows zero or many — use it when a single group's update could emit multiple output events.
+- **When to reach for this vs a windowed aggregation:** windowed aggregations (Module 4.4's first example) cover fixed time-bucket rollups; `mapGroupsWithState` is for genuinely custom per-key state machines (session tracking, deduplication windows, running custom business logic) that don't fit a simple window/aggregate shape.
+
+**Idempotent Writes via Delta's Built-in Transaction Metadata**
+
+The `foreachBatch` + keyed `MERGE` pattern (Module 4.11) is the general-purpose idempotency solution, but for simple **append-only** sinks, Delta has a lighter-weight built-in mechanism:
+
+```python
+app_id = "orders_ingest_job"
+
+def write_batch(batch_df, batch_id):
+    (batch_df.write.format("delta")
+     .option("txnAppId", app_id)        # a stable ID identifying this specific writer/job
+     .option("txnVersion", batch_id)     # the streaming micro-batch ID, monotonically increasing
+     .mode("append")
+     .saveAsTable("bronze_orders"))
+
+stream.writeStream.foreachBatch(write_batch).start()
+```
+If the same `(txnAppId, txnVersion)` pair is ever written again (e.g., after a failure and batch re-execution), Delta detects it and **skips the duplicate write automatically** — no manual `MERGE` needed for simple append cases.
+
 ---
 
 ### 4.5 Fault Tolerance & Trigger Controls
@@ -1176,6 +1297,32 @@ def orders_quarantine():
 
 ---
 
+### 4.8b Declarative CDC in DLT: `APPLY CHANGES INTO`
+
+Module 7.2 showed **hand-written** `MERGE`-based SCD Type 1/2 logic. DLT has a **purpose-built declarative construct** for exactly this, so most teams shouldn't hand-write CDC MERGE logic inside a DLT pipeline at all.
+
+```python
+import dlt
+
+dlt.create_streaming_table("dim_customer_scd1")
+
+dlt.apply_changes(
+    target="dim_customer_scd1",
+    source="cdc_customer_changes",             # a streaming source of change events (e.g., from CDF or Debezium)
+    keys=["customer_id"],
+    sequence_by="change_timestamp",            # determines "latest" when multiple changes arrive
+    apply_as_deletes=F.expr("operation = 'DELETE'"),
+    except_column_list=["operation", "change_timestamp"],
+    stored_as_scd_type=1                       # or 2 for full history tracking
+)
+```
+
+For **SCD Type 2**, the only change is `stored_as_scd_type=2` — DLT automatically manages `__START_AT`/`__END_AT` columns tracking validity periods, without you writing any `is_current`/`whenMatchedUpdate` logic yourself.
+
+**Interview answer:** *"`APPLY CHANGES INTO` (the `dlt.apply_changes` Python API) replaces hand-written `MERGE` logic for CDC inside a DLT pipeline. It handles out-of-order change events via `sequence_by`, supports both SCD Type 1 and Type 2 with a single parameter flip, and manages the historical tracking columns automatically for Type 2 — the Module 7.2 manual MERGE pattern is what you'd reach for **outside** DLT, in a plain Structured Streaming or batch job."*
+
+---
+
 ### 4.9 DLT Observability & Maintenance
 
 ```python
@@ -1185,6 +1332,42 @@ event_log_df.selectExpr("details:flow_progress.data_quality").show(truncate=Fals
 ```
 
 DLT pipelines automatically run `VACUUM`/`OPTIMIZE` on managed tables as part of their maintenance cycle — no manual scheduling needed.
+
+---
+
+### 4.9b Monitoring a Running Streaming Query
+
+Beyond the Spark UI's Streaming tab, the `StreamingQuery` object itself exposes live health metrics — the standard way to build custom alerting or a health-check endpoint for a production stream.
+
+```python
+query = stream.writeStream.format("delta") \
+    .option("checkpointLocation", "dbfs:/checkpoints/job1").start()
+
+query.status                # {"message": "Processing new data", "isDataAvailable": True, "isTriggerActive": True}
+query.lastProgress           # dict: batch duration, input/processed rows-per-second, per-source offsets
+query.recentProgress         # list of the last several lastProgress snapshots
+query.id                     # unique, survives restarts from the same checkpoint
+query.runId                  # unique per actual run (changes on every restart)
+
+query.awaitTermination()     # blocks until the query stops or errors
+```
+
+```python
+# Programmatic alerting via a StreamingQueryListener - reacts to lifecycle events in real time
+from pyspark.sql.streaming import StreamingQueryListener
+
+class MyListener(StreamingQueryListener):
+    def onQueryStarted(self, event): print(f"Started: {event.id}")
+    def onQueryProgress(self, event):
+        rate = event.progress.inputRowsPerSecond
+        if rate is not None and rate < 1.0:
+            print(f"WARNING: query {event.progress.id} input rate has dropped to {rate}")
+    def onQueryTerminated(self, event): print(f"Terminated: {event.id}, error: {event.exception}")
+
+spark.streams.addListener(MyListener())
+```
+
+**Interview answer:** *"`lastProgress` gives you the same numbers the Spark UI shows — batch duration, rows/sec in and processed, per-source offset progress — but as a queryable dict, so you can pipe it into your own alerting (Slack, PagerDuty) rather than staring at a UI. `StreamingQueryListener` is the event-driven version of the same idea, letting you react the moment a query starts, makes progress, or terminates, instead of polling."*
 
 ---
 
@@ -2044,6 +2227,23 @@ training_df = training_set.load_df()
 
 At inference time, the same `FeatureLookup` definitions are reused so the serving path pulls **identical** feature logic — the core value proposition over manually re-deriving features in two places.
 
+**Online store vs offline store** — a distinction that comes up constantly once real-time serving is in scope:
+
+| | Offline Store | Online Store |
+|---|---|---|
+| Backing storage | Delta table | Low-latency key-value store (e.g., DynamoDB, Cosmos DB, MySQL — a separate managed sync target) |
+| Access pattern | Batch scans, joins for training | Single-key point lookups, millisecond latency |
+| Used for | Training set construction (as shown above) | Real-time model serving endpoints needing feature values at request time |
+
+```python
+# Publish offline features to an online store for low-latency serving lookups
+fe.publish_table(
+    name="main.ml.customer_features",
+    online_store=... # online store connection config (e.g., DynamoDB)
+)
+```
+**Interview answer:** *"The offline store is just a Delta table — great for training, useless for a live request that needs a feature value in milliseconds. The online store is a separate, purpose-built low-latency store that the Feature Store publishes to, so a Model Serving endpoint can look up a customer's current features fast enough for real-time inference instead of scanning a Delta table per request."*
+
 ---
 
 ### 8.3 Model Serving
@@ -2075,6 +2275,27 @@ response = client.predict(endpoint="churn-model-endpoint", inputs={"dataframe_re
 
 - **Scale-to-zero**: endpoint compute scales down to zero when idle, reducing cost for low-traffic models.
 - Same infrastructure also serves **external/foundation models** (e.g., a hosted LLM) behind a unified endpoint interface — see 8.4.
+
+**Traffic splitting for A/B testing & canary rollouts** — one endpoint can serve **multiple model versions simultaneously**, splitting requests by percentage:
+
+```python
+client.update_endpoint(
+    endpoint="churn-model-endpoint",
+    config={
+        "served_entities": [
+            {"entity_name": "main.ml.churn_model", "entity_version": "3", "name": "champion"},
+            {"entity_name": "main.ml.churn_model", "entity_version": "4", "name": "challenger"}
+        ],
+        "traffic_config": {
+            "routes": [
+                {"served_model_name": "champion", "traffic_percentage": 90},
+                {"served_model_name": "challenger", "traffic_percentage": 10}
+            ]
+        }
+    }
+)
+```
+**Interview answer:** *"Traffic splitting lets you validate a new model version against real production traffic at low risk — route 90% to the proven 'champion' and 10% to the 'challenger,' compare their live performance/business metrics, then gradually shift traffic (or roll back instantly) without redeploying anything — it's the same canary-release pattern used for general software rollouts, applied to models."*
 
 ---
 
@@ -2480,6 +2701,31 @@ df.withColumn("id", F.col("id").cast("string"))
 df.withColumn("salary", F.col("salary").cast(DoubleType()))
 df.selectExpr("id", "CAST(salary AS INT) AS salary_int")
 ```
+
+### 9.10b Additional Frequently-Used Functions
+
+```python
+# Surrogate/unique key generation
+df.withColumn("row_id", F.monotonically_increasing_id())     # unique but NOT sequential/gapless across partitions
+df.withColumn("hash_key", F.sha2(F.concat_ws("|", "col1", "col2"), 256))   # deterministic hash key - preferred for idempotent surrogate keys
+df.withColumn("md5_key", F.md5(F.col("id").cast("string")))
+
+# Generate a sequence of values (e.g., a date spine)
+spark.sql("SELECT sequence(to_date('2024-01-01'), to_date('2024-01-10'), interval 1 day) AS dates") \
+     .select(F.explode("dates").alias("date"))
+
+# Combine two arrays element-wise into an array of structs
+df.withColumn("zipped", F.arrays_zip("array_col_1", "array_col_2"))
+
+# Sampling
+df.sample(fraction=0.1, seed=42)                          # simple random sample
+df.sampleBy("dept", fractions={"Sales": 0.5, "Eng": 0.1}, seed=42)   # stratified sample per group
+train_df, test_df = df.randomSplit([0.8, 0.2], seed=42)   # ML train/test split
+```
+
+**Interview answer (on `monotonically_increasing_id`):** *"It guarantees uniqueness and that IDs increase monotonically within a partition ordering, but it is **not** sequential or gapless — the actual values embed the partition ID, so there are large gaps between partitions. For a true gapless sequence you'd need Delta Identity Columns (Module 2.10) instead; for a stable, reproducible key, `sha2`/`md5` over the business key is usually the better choice since it's deterministic across re-runs."*
+
+---
 
 ### 9.11 RDD Common Operations (still occasionally asked)
 
