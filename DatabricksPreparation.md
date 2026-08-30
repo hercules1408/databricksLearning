@@ -255,3 +255,88 @@ A structured syllabus and tracking index covering the 7 core domains required fo
   * RocksDB state store memory exhaustion fixes
   * Watermark lag resolution and micro-batch tuning
   * Cloud storage rate-limit throttling (HTTP 503/429) backoff handling
+
+
+ 
+Module 1: Apache Spark Core & PySpark Internals
+1.1 Distributed Runtime Architecture & Execution Model
+Understanding how Spark translates PySpark code into distributed execution is the most common starting point for Databricks interviews.
+
+Application: Your entire PySpark script or notebook.
+
+Job: Triggered by an Action (e.g., .show(), .count(), .write).
+
+Stage: A Job is divided into Stages by Wide Transformations (operations that require shuffling data across the network, like a groupBy or join).
+
+Task: The smallest unit of work. One task processes one partition of data on a single executor core.
+
+1.3 Transformations, Actions & Shuffling Mechanics
+In PySpark, transformations are lazy, meaning they are merely appended to the logical execution plan (DAG) until an action triggers execution.
+
+Python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+
+spark = SparkSession.builder.appName("InterviewPrep").getOrCreate()
+
+# NARROW TRANSFORMATION: No shuffle required (data stays on the same node)
+df = spark.read.parquet("dbfs:/data/transactions")
+df_filtered = df.filter(col("amount") > 1000)
+df_selected = df_filtered.select("account_id", "amount")
+
+# WIDE TRANSFORMATION: Triggers a shuffle (data moves across network)
+df_grouped = df_selected.groupBy("account_id").sum("amount")
+
+# ACTION: Triggers the DAG execution
+df_grouped.write.format("delta").save("dbfs:/data/high_value_accounts")
+1.7 Partitioning & Data Distribution
+Interviewers frequently ask about the difference between repartition() and coalesce() because misusing them causes severe performance bottlenecks.
+
+repartition(n): Does a full shuffle of the data to create n partitions of equal size. Use this when you need to increase partitions or balance heavily skewed data.
+
+coalesce(n): Combines existing partitions to avoid a full shuffle. It can only decrease the number of partitions.
+
+Python
+# BAD: Triggering a full shuffle just to reduce files
+df.repartition(1).write.parquet("dbfs:/output/bad_example")
+
+# GOOD: Merging partitions locally without a network shuffle
+df.coalesce(1).write.parquet("dbfs:/output/good_example")
+
+# REPARTITION BY COLUMN: Useful before writing to Delta if querying by a specific key
+df.repartition(col("transaction_date")).write.partitionBy("transaction_date").format("delta").save("...")
+1.8 Distributed Join Internals
+Choosing the right join strategy is critical for performance. The Catalyst Optimizer usually chooses for you, but you must know how to force a Broadcast Hash Join (BHJ) to avoid shuffling large datasets.
+
+Python
+from pyspark.sql.functions import broadcast
+
+df_large_transactions = spark.table("transactions") # 10 Billion rows
+df_small_accounts = spark.table("accounts")         # 10,000 rows
+
+# BROADCAST HASH JOIN: Sends the small DataFrame to all executor nodes
+# This avoids a massive network shuffle of the large transactions table
+df_joined = df_large_transactions.join(
+    broadcast(df_small_accounts),
+    on="account_id",
+    how="inner"
+)
+Note: In Databricks, Adaptive Query Execution (AQE) automatically converts Sort-Merge Joins to Broadcast Joins at runtime if the post-filter data size is smaller than spark.sql.autoBroadcastJoinThreshold (default 10MB).
+
+1.9 PySpark Architecture & Pandas UDFs
+Historically, PySpark suffered from serialization overhead because data had to move between the JVM and Python workers using Pickling. Modern PySpark uses PyArrow for in-memory columnar data transfer.
+
+For custom Python logic, standard UDFs operate row-by-row and are slow. Pandas UDFs (Vectorized UDFs) execute over batches of rows simultaneously.
+
+Python
+import pandas as pd
+from pyspark.sql.functions import pandas_udf
+from pyspark.sql.types import DoubleType
+
+# Vectorized operations are significantly faster than standard PySpark UDFs
+@pandas_udf(DoubleType())
+def calculate_compound_interest_udf(principal: pd.Series, rate: pd.Series) -> pd.Series:
+    # Operations execute on an entire Pandas Series at once (Apache Arrow)
+    return principal * (1 + rate) ** 5
+
+df.withColumn("projected_value", calculate_compound_interest_udf(col("balance"), col("interest_rate")))
