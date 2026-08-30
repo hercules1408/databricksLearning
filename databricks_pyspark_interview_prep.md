@@ -760,6 +760,50 @@ INSERT INTO main.sales.dim_customer (customer_id, customer_name) VALUES ('C1', '
 
 ---
 
+### 2.11 `COPY INTO` vs Auto Loader
+
+Both load files into a Delta table incrementally and idempotently (won't reprocess a file already loaded), but they solve different scales of problem — this comparison is a very common interview question.
+
+```sql
+COPY INTO main.sales.orders
+FROM 's3://bucket/raw/orders/'
+FILEFORMAT = JSON
+FORMAT_OPTIONS ('mergeSchema' = 'true')
+COPY_OPTIONS ('mergeSchema' = 'true');
+```
+
+| | `COPY INTO` | Auto Loader (`cloudFiles`) |
+|---|---|---|
+| Execution model | A single SQL command, run repeatedly (e.g., on a schedule) | A streaming source, runs continuously or via `trigger(availableNow=True)` |
+| File tracking | Tracks loaded files in the Delta transaction log itself | Tracks via RocksDB-backed state + `schemaLocation` |
+| Scale | Best for thousands of files per run | Scales to millions/billions of files, especially with File Notification mode |
+| Schema evolution | Basic (`mergeSchema` option) | Rich (`addNewColumns`/`rescue`/`failOnNewColumns`/`none`, `_rescuedDataColumn`) |
+| Setup complexity | Minimal — just a SQL statement | Requires a checkpoint + schema location, more moving parts |
+| Typical use case | Simple, low-file-count periodic batch loads | High-volume, continuous or near-real-time ingestion pipelines |
+
+**Interview answer:** *"`COPY INTO` is the simpler tool — a single idempotent SQL statement, great for periodic batch loads of a few thousand files. Auto Loader is the scalable tool — built for continuous, high-volume ingestion where file counts can reach millions, with much richer schema evolution and state tracking. If someone describes a small nightly batch job, `COPY INTO` is usually the right answer; if they describe a continuously arriving stream of files, it's Auto Loader."*
+
+---
+
+### 2.12 Predictive Optimization
+
+A **managed service** (Unity Catalog-enabled) that automatically runs `OPTIMIZE`, `VACUUM`, and `ANALYZE` on tables **without manual scheduling** — Databricks decides when and how often based on actual table activity, instead of a human guessing a maintenance cadence.
+
+```sql
+-- Enable at the metastore, catalog, schema, or table level
+ALTER TABLE main.sales.orders SET TBLPROPERTIES ('delta.enablePredictiveOptimization' = 'true');
+```
+
+```sql
+-- Check what Predictive Optimization has been doing
+SELECT * FROM system.storage.predictive_optimization_operations_history
+WHERE table_name = 'orders';
+```
+
+**Interview answer:** *"Before Predictive Optimization, teams had to schedule their own `OPTIMIZE`/`VACUUM` jobs and guess the right frequency — too often wastes compute, too rarely lets small files or bloat accumulate. Predictive Optimization uses Databricks' own visibility into table write patterns to decide when maintenance is actually worth running, removing that manual tuning entirely for Unity Catalog managed tables."*
+
+---
+
 ## Module 3: Compute Architecture, Cluster Sizing & Engine Optimization
 
 ### 3.1 Compute Topologies & Types
@@ -1067,9 +1111,18 @@ query = (df.writeStream
 
 The checkpoint directory stores `offsets/` (what's been read), `commits/` (what's been fully processed), and `state/` (operator state) — this is what allows exact recovery after a failure.
 
+**Note:** `trigger(once=True)` is the older, now-deprecated way to express "process everything available then stop" — `trigger(availableNow=True)` replaced it and should always be preferred, since it can break the backlog into multiple micro-batches (better for very large backlogs) rather than forcing one giant batch.
+
 ---
 
 ### 4.6 & 4.7 Delta Live Tables (DLT): Declarative Framework & Table Constructs
+
+**Pipeline execution modes** (a DLT pipeline-level setting, distinct from the streaming triggers above):
+
+| Mode | Behavior |
+|---|---|
+| **Triggered** | Runs once, processes all currently available data, then stops — cheaper, good for scheduled/batch-like DLT pipelines |
+| **Continuous** | Keeps the pipeline's cluster running and processes new data as it arrives — lower latency, higher cost since compute never spins down |
 
 ```python
 import dlt
@@ -1544,6 +1597,19 @@ count = dbutils.jobs.taskValues.get(taskKey="upstream_task", key="row_count", de
 
 Workflows support **conditional branching** (If/Else tasks based on task outcomes) and **For-Each** tasks (looping a task template over a list of parameters), all defined as a DAG of tasks across notebooks, Python scripts, SQL, DLT pipelines, and dbt.
 
+**Job cluster reuse** — a cost-efficiency detail worth knowing: by default, each task in a multi-task job can spin up its *own* job cluster, meaning startup time (and cost) is paid repeatedly. Assigning multiple tasks the **same `job_cluster_key`** makes them share a single cluster across the whole job run instead.
+
+```json
+{
+  "job_clusters": [{"job_cluster_key": "shared_cluster", "new_cluster": {"num_workers": 4, "spark_version": "..."}}],
+  "tasks": [
+    {"task_key": "extract", "job_cluster_key": "shared_cluster", "notebook_task": {...}},
+    {"task_key": "transform", "job_cluster_key": "shared_cluster", "notebook_task": {...}}
+  ]
+}
+```
+**Interview answer:** *"Sharing a `job_cluster_key` across tasks avoids paying cluster startup cost per task — the trade-off is that tasks now compete for the same compute resources instead of getting dedicated capacity, so it's the right call for lightweight sequential tasks, not for a heavy Spark job followed by a heavy ML training task that would rather have isolated resources."*
+
 ---
 
 ### 6.2 Reliability, Failure Handling & Retries
@@ -1720,6 +1786,32 @@ def test_uses_dbutils():
 ```
 
 **Key libraries:** `pytest` (test runner), `chispa` (Spark-friendly DataFrame equality assertions with readable diffs), `unittest.mock` (mocking `dbutils`, external API calls). Run these as a step in CI (e.g., a GitHub Actions/Azure DevOps pipeline) **before** a Databricks Asset Bundle deploy — fail the pipeline before it ever reaches a real cluster.
+
+---
+
+### 6.8 Authentication Methods (CLI, API, CI/CD)
+
+| Method | Typical Use | Notes |
+|---|---|---|
+| **Personal Access Token (PAT)** | Quick CLI/API scripting, local dev | Tied to a specific user; expires; simplest to set up but weakest for production automation (leaves if the user leaves) |
+| **OAuth (User-to-Machine / Machine-to-Machine)** | Interactive CLI login (U2M), or app-to-app automation (M2M) | Short-lived tokens, refreshable, better security posture than long-lived PATs |
+| **Service Principal** | CI/CD pipelines, production jobs, Terraform/DABs deployments | Not tied to any individual human user — the recommended identity for automated/production workflows |
+
+```bash
+# PAT-based CLI auth
+databricks configure --token   # prompts for host + PAT
+
+# OAuth U2M (opens a browser login)
+databricks auth login --host https://<workspace>.databricks.com
+
+# Service Principal (M2M OAuth) - typical CI/CD pattern
+export DATABRICKS_CLIENT_ID=<sp-client-id>
+export DATABRICKS_CLIENT_SECRET=<sp-secret>
+export DATABRICKS_HOST=https://<workspace>.databricks.com
+databricks bundle deploy   # authenticates as the service principal automatically
+```
+
+**Interview answer:** *"PATs are fine for a developer's own local scripting but are a liability in CI/CD since they're tied to a person's identity and don't rotate automatically. Production pipelines should authenticate as a **Service Principal** via OAuth M2M — it's an identity owned by the platform/team, not an individual, so it survives personnel changes and can be scoped/audited independently."*
 
 ---
 
@@ -2126,6 +2218,47 @@ w.quality_monitors.create(
 - Three monitor types: **Snapshot** (point-in-time tables), **Time Series** (tables with a timestamp column, tracks metrics over time), **Inference Log** (ML model input/output tables — tracks prediction drift and label drift for deployed models).
 
 **Interview answer:** *"Lakehouse Monitoring is Databricks' answer to hand-rolled data quality frameworks (like Great Expectations) for the specific case of ongoing drift/quality tracking on a table already in Unity Catalog — it's complementary to DLT Expectations (Module 4.8), which validate rows at ingestion time, whereas Monitoring tracks aggregate statistical health of a table over time."*
+
+---
+
+### 8.11 Databricks AutoML
+
+Generates a **baseline set of trained models + full source notebooks** for a classification/regression/forecasting problem from a single command — meant as a fast starting point (and a transparent one, since you get the actual generated code, not a black box).
+
+```python
+from databricks import automl
+
+summary = automl.classify(
+    dataset=training_df,
+    target_col="churned",
+    timeout_minutes=30
+)
+
+print(summary.best_trial.model_path)   # MLflow model URI of the best run
+```
+
+- Runs multiple algorithms/hyperparameter combinations, tracks every trial in **MLflow** automatically, and generates an editable notebook per trial so you can take the best one and keep iterating manually instead of treating it as a final answer.
+- **Interview framing:** *"AutoML is a fast baseline generator, not a replacement for a data scientist's judgment — its real value is the generated, fully-editable notebook you can build on top of, not just a single 'best model' output."*
+
+---
+
+### 8.12 Databricks Marketplace
+
+An **open marketplace** for discovering and subscribing to third-party datasets, ML models, and Databricks-native applications/solution accelerators — delivered via **Delta Sharing** (Module 5.9) under the hood, so a subscribed dataset shows up as a live, governed table in your own Unity Catalog without any data movement/ETL required on your end.
+
+---
+
+### 8.13 Pricing Tiers & Feature Gating
+
+Not itself a technical concept, but a genuinely common "gotcha" in system-design interviews: **not every feature discussed above is available on every Databricks pricing plan.**
+
+| Tier | Notable gating |
+|---|---|
+| **Standard** | Core Spark/notebooks/jobs; no Unity Catalog |
+| **Premium** | Unity Catalog, RBAC, Databricks SQL, most governance/security features |
+| **Enterprise** | Everything in Premium + advanced compliance/security controls (e.g., customer-managed keys, enhanced audit, PrivateLink in some clouds) |
+
+**Interview answer:** *"If a system design answer leans on Unity Catalog governance, row filters, or column masking, it's worth noting out loud that these require at least a Premium-tier workspace — an interviewer designing for a cost-constrained or legacy Standard-tier environment may specifically want to hear that trade-off acknowledged."*
 
 ---
 
