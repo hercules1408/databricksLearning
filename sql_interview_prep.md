@@ -781,62 +781,560 @@ JOIN meetings b
 
 ---
 
-# 13. Databricks SQL / Delta Lake — Key Function Cheat Sheet (with Examples)
+# 13. Databricks SQL / Delta Lake — Function Cheat Sheet (with Sample Data & Output)
 
-| Function / Command | Purpose | Example |
+Each subsection sets up one small sample table, then walks through every related function on its own — with the purpose, the query, and the actual output — so you can see the transformation clearly instead of scanning a dense table.
+
+---
+
+## 13.1 Array & Collection Functions
+
+**Sample table `orders`**
+
+| id | customer_id | product | items |
+|---|---|---|---|
+| 1 | 101 | Laptop | `['P1','P2','P3']` |
+| 2 | 101 | Mouse  | `['P4']` |
+| 3 | 102 | Laptop | `['P1']` |
+
+<br>
+
+**`EXPLODE()`** — splits an array into multiple rows
+```sql
+SELECT id, EXPLODE(items) AS item FROM orders WHERE id = 1;
+```
+**Output:**
+
+| id | item |
+|---|---|
+| 1 | P1 |
+| 1 | P2 |
+| 1 | P3 |
+
+<br>
+
+**`POSEXPLODE()`** — like EXPLODE, but also returns each element's position
+```sql
+SELECT id, POSEXPLODE(items) AS (pos, item) FROM orders WHERE id = 1;
+```
+**Output:**
+
+| id | pos | item |
 |---|---|---|
-| `EXPLODE()` | Splits an array/map column into multiple rows | `SELECT id, EXPLODE(items) AS item FROM orders;` → one row per item in the array |
-| `POSEXPLODE()` | Like EXPLODE but also returns the element's position/index | `SELECT id, POSEXPLODE(items) AS (pos, item) FROM orders;` → adds a 0-based index column |
-| `COLLECT_LIST()` | Aggregates column values into an array (keeps duplicates) | `SELECT customer_id, COLLECT_LIST(product) FROM orders GROUP BY customer_id;` → array of all products bought, dupes included |
-| `COLLECT_SET()` | Aggregates column values into an array (unique values only) | `SELECT customer_id, COLLECT_SET(product) FROM orders GROUP BY customer_id;` → array of distinct products bought |
-| `LATERAL VIEW` | Used with EXPLODE to flatten nested arrays/structs into rows | `SELECT id, item.product_id FROM orders LATERAL VIEW EXPLODE(items) t AS item;` |
-| `TRANSFORM()` | Applies a lambda function to each element of an array | `SELECT TRANSFORM(prices, x -> x * 1.1) FROM products;` → increases every price in the array by 10% |
-| `FILTER()` | Filters array elements based on a lambda condition | `SELECT FILTER(scores, x -> x > 50) FROM students;` → keeps only scores above 50 |
-| `AGGREGATE()` | Reduces an array to a single value using an accumulator (like fold/reduce) | `SELECT AGGREGATE(prices, 0, (acc, x) -> acc + x) FROM cart;` → sums all prices in the array |
-| `ARRAY_DISTINCT()` | Removes duplicate elements from an array | `SELECT ARRAY_DISTINCT(ARRAY(1,2,2,3));` → `[1,2,3]` |
-| `ARRAYS_ZIP()` | Merges multiple arrays element-wise into structs | `SELECT ARRAYS_ZIP(ARRAY('a','b'), ARRAY(1,2));` → `[{a,1},{b,2}]` |
-| `ARRAY_SORT()` | Sorts elements of an array | `SELECT ARRAY_SORT(ARRAY(3,1,2));` → `[1,2,3]` |
-| `GET_JSON_OBJECT()` | Extracts a value from a JSON string using a path expression | `SELECT GET_JSON_OBJECT(raw_json, '$.user.id') FROM events;` → pulls `user.id` out of a JSON string |
-| `FROM_JSON()` | Parses a JSON string into a struct/map based on a given schema | `SELECT FROM_JSON(raw_json, 'user STRUCT<id:INT, name:STRING>') FROM events;` |
-| `TO_JSON()` | Converts a struct/map column into a JSON string | `SELECT TO_JSON(STRUCT(id, name)) FROM users;` → `{"id":1,"name":"Sam"}` |
-| `PARSE_JSON()` | Parses text into a semi-structured VARIANT type | `SELECT PARSE_JSON('{"a":1}');` → queryable VARIANT value |
-| `SCHEMA_OF_JSON()` | Infers the schema of a JSON string | `SELECT SCHEMA_OF_JSON('{"a":1,"b":"x"}');` → returns `STRUCT<a:BIGINT,b:STRING>` |
-| `DATE_TRUNC()` | Truncates a date/timestamp to a specified unit (month, year, etc.) | `SELECT DATE_TRUNC('MONTH', order_date) FROM orders;` → rounds every date down to the 1st of its month |
-| `DATEDIFF()` | Returns the number of days between two dates | `SELECT DATEDIFF('2026-08-30','2026-08-01');` → `29` |
-| `DATE_ADD()` / `DATE_SUB()` | Adds/subtracts a number of days from a date | `SELECT DATE_ADD(order_date, 7) FROM orders;` → order date + 7 days |
-| `ADD_MONTHS()` | Adds a given number of months to a date | `SELECT ADD_MONTHS('2026-01-15', 3);` → `2026-04-15` |
-| `MONTHS_BETWEEN()` | Returns the number of months between two dates | `SELECT MONTHS_BETWEEN('2026-06-01','2026-01-01');` → `5.0` |
-| `TO_DATE()` / `TO_TIMESTAMP()` | Converts a string to a date/timestamp type | `SELECT TO_DATE('2026-08-30','yyyy-MM-dd');` |
-| `UNIX_TIMESTAMP()` | Converts a timestamp to Unix epoch seconds | `SELECT UNIX_TIMESTAMP(event_time) FROM events;` |
-| `WINDOW()` | Buckets timestamps into fixed time windows for streaming/batch aggregation | `SELECT WINDOW(event_time,'1 hour'), COUNT(*) FROM events GROUP BY WINDOW(event_time,'1 hour');` → hourly event counts |
-| `RANK()` | Assigns rank with gaps left after ties | `RANK() OVER (ORDER BY salary DESC)` → ties get same rank, next rank skips (1,1,3) |
-| `DENSE_RANK()` | Assigns rank without gaps after ties | `DENSE_RANK() OVER (ORDER BY salary DESC)` → ties get same rank, no skipping (1,1,2) |
-| `ROW_NUMBER()` | Assigns a unique sequential number within a partition | `ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC)` → 1,2,3... per department |
-| `NTILE(n)` | Divides rows into n roughly equal-sized buckets | `NTILE(4) OVER (ORDER BY salary DESC)` → splits employees into 4 salary quartiles |
-| `LAG()` / `LEAD()` | Accesses the previous/next row's value within a window | `LAG(revenue) OVER (ORDER BY month)` → previous month's revenue on the same row |
-| `FIRST_VALUE()` / `LAST_VALUE()` | Returns the first/last value in a window frame | `FIRST_VALUE(order_date) OVER (PARTITION BY customer_id ORDER BY order_date)` → each customer's first order date |
-| `PERCENTILE_CONT()` / `PERCENTILE_APPROX()` | Computes exact / approximate percentile values | `PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY salary)` → median salary |
-| `PIVOT()` | Rotates unique row values into multiple columns | `SELECT * FROM sales PIVOT (SUM(sales) FOR quarter IN ('Q1','Q2','Q3','Q4'));` → one column per quarter |
-| `UNPIVOT()` | Converts columns back into rows | `SELECT * FROM sales_wide UNPIVOT (sales FOR quarter IN (Q1,Q2,Q3,Q4));` → columns become rows again |
-| `MERGE INTO` | Upserts (insert/update/delete) rows in a Delta table based on a match condition | `MERGE INTO target t USING source s ON t.id = s.id WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *;` |
-| `MAP_FROM_ARRAYS()` | Creates a map from two arrays (keys array, values array) | `SELECT MAP_FROM_ARRAYS(ARRAY('a','b'), ARRAY(1,2));` → `{"a":1,"b":2}` |
-| `SIZE()` | Returns the length of an array or map | `SELECT SIZE(items) FROM orders;` → number of items in the order |
-| `SPLIT()` | Splits a string into an array using a delimiter | `SELECT SPLIT('a,b,c', ',');` → `['a','b','c']` |
-| `CONCAT_WS()` | Concatenates strings with a specified separator, ignoring NULLs | `SELECT CONCAT_WS('-', city, state, zip) FROM addresses;` → `"Pune-MH-411001"` |
-| `REGEXP_EXTRACT()` | Extracts a substring matching a regex pattern | `SELECT REGEXP_EXTRACT(email, '@(.+)', 1) FROM users;` → domain from email |
-| `REGEXP_REPLACE()` | Replaces substrings matching a regex pattern | `SELECT REGEXP_REPLACE(phone, '[^0-9]', '') FROM users;` → strips non-digits from phone numbers |
-| `COALESCE()` | Returns the first non-NULL value from a list of expressions | `SELECT COALESCE(phone, alt_phone, 'N/A') FROM users;` → falls back through options |
-| `NULLIF()` | Returns NULL if two expressions are equal, else the first expression | `SELECT NULLIF(discount, 0) FROM orders;` → converts 0 discount to NULL |
-| `TRY_CAST()` | Casts a value, returning NULL instead of erroring on failure | `SELECT TRY_CAST(amount_str AS DECIMAL(10,2)) FROM raw_data;` → bad values become NULL instead of failing the query |
-| `IDENTITY` / `GENERATED ALWAYS AS IDENTITY` | Auto-increments a surrogate key column in a Delta table | `CREATE TABLE t (id BIGINT GENERATED ALWAYS AS IDENTITY, name STRING);` |
-| `VACUUM` | Removes old/unreferenced data files from a Delta table to reclaim storage | `VACUUM sales_delta RETAIN 168 HOURS;` → cleans up files older than 7 days |
-| `OPTIMIZE ... ZORDER BY` | Compacts small files and co-locates related data for faster reads | `OPTIMIZE sales_delta ZORDER BY (customer_id);` → speeds up queries filtering on customer_id |
-| `DESCRIBE HISTORY` | Shows the version history/audit log of a Delta table | `DESCRIBE HISTORY sales_delta;` → lists every write/version with timestamp and operation |
-| `VERSION AS OF` / `TIMESTAMP AS OF` | Time-travel query to read a previous version of a Delta table | `SELECT * FROM sales_delta VERSION AS OF 5;` → reads the table as it looked at version 5 |
-| `RESTORE TABLE` | Reverts a Delta table to a previous version or timestamp | `RESTORE TABLE sales_delta TO VERSION AS OF 5;` |
-| `DEEP CLONE` / `SHALLOW CLONE` | Creates a full copy / metadata-only copy of a Delta table | `CREATE TABLE sales_backup DEEP CLONE sales_delta;` → full independent copy of data + metadata |
-| `CREATE OR REFRESH STREAMING TABLE` | Defines a Delta Live Tables streaming table that ingests incrementally | `CREATE OR REFRESH STREAMING TABLE raw_events AS SELECT * FROM STREAM(source_table);` |
-| `APPLY_CHANGES INTO` (DLT) | Handles CDC upserts/deletes into a target streaming table | `APPLY CHANGES INTO target FROM STREAM(cdc_feed) KEYS (id) SEQUENCE BY updated_at;` |
+| 1 | 0 | P1 |
+| 1 | 1 | P2 |
+| 1 | 2 | P3 |
+
+<br>
+
+**`COLLECT_LIST()`** — aggregates values into an array, keeping duplicates
+```sql
+SELECT customer_id, COLLECT_LIST(product) AS products
+FROM orders
+GROUP BY customer_id;
+```
+**Output:**
+
+| customer_id | products |
+|---|---|
+| 101 | `['Laptop','Mouse']` |
+| 102 | `['Laptop']` |
+
+<br>
+
+**`COLLECT_SET()`** — aggregates values into an array, unique only
+```sql
+-- assume a 4th row exists: id=4, customer_id=101, product='Laptop'
+SELECT customer_id, COLLECT_SET(product) AS unique_products
+FROM orders
+GROUP BY customer_id;
+```
+**Output:** `101 → ['Laptop','Mouse']` — the duplicate `'Laptop'` is collapsed, unlike `COLLECT_LIST`
+
+<br>
+
+**`LATERAL VIEW`** — flattens nested arrays/structs into rows (pairs with EXPLODE)
+```sql
+SELECT id, item FROM orders LATERAL VIEW EXPLODE(items) t AS item WHERE id = 2;
+```
+**Output:** `(2, 'P4')`
+
+<br>
+
+**`ARRAY_DISTINCT()`** — removes duplicate elements from an array
+```sql
+SELECT ARRAY_DISTINCT(ARRAY(1, 2, 2, 3));
+```
+**Output:** `[1, 2, 3]`
+
+<br>
+
+**`ARRAY_SORT()`** — sorts elements of an array
+```sql
+SELECT ARRAY_SORT(ARRAY(3, 1, 2));
+```
+**Output:** `[1, 2, 3]`
+
+<br>
+
+**`ARRAYS_ZIP()`** — merges multiple arrays element-wise
+```sql
+SELECT ARRAYS_ZIP(ARRAY('a','b'), ARRAY(1,2));
+```
+**Output:** `[{'a',1}, {'b',2}]` — pairs elements by matching position
+
+<br>
+
+**`SIZE()`** — returns the length of an array or map
+```sql
+SELECT id, SIZE(items) AS item_count FROM orders;
+```
+**Output:**
+
+| id | item_count |
+|---|---|
+| 1 | 3 |
+| 2 | 1 |
+| 3 | 1 |
+
+<br>
+
+**`MAP_FROM_ARRAYS()`** — builds a map from a keys array and a values array
+```sql
+SELECT MAP_FROM_ARRAYS(ARRAY('a','b'), ARRAY(1,2));
+```
+**Output:** `{'a': 1, 'b': 2}`
+
+<br>
+
+**Sample table `products`** (for the lambda functions below)
+
+| id | prices |
+|---|---|
+| 1 | `[10, 20, 30]` |
+
+<br>
+
+**`TRANSFORM()`** — applies a lambda to every element of an array
+```sql
+SELECT TRANSFORM(prices, x -> x * 1.1) FROM products WHERE id = 1;
+```
+**Output:** `[11.0, 22.0, 33.0]` — every price scaled up 10%
+
+<br>
+
+**`FILTER()`** — keeps only array elements matching a lambda condition
+```sql
+SELECT FILTER(prices, x -> x > 15) FROM products WHERE id = 1;
+```
+**Output:** `[20, 30]`
+
+<br>
+
+**`AGGREGATE()`** — reduces an array to one value using an accumulator
+```sql
+SELECT AGGREGATE(prices, 0, (acc, x) -> acc + x) FROM products WHERE id = 1;
+```
+**Output:** `60` — sum of all elements
+
+---
+
+## 13.2 JSON Functions
+
+**Sample table `events`**
+
+| id | raw_json |
+|---|---|
+| 1 | `'{"user":{"id":101,"name":"Asha"}}'` |
+
+<br>
+
+**`GET_JSON_OBJECT()`** — extracts one value from a JSON string by path
+```sql
+SELECT GET_JSON_OBJECT(raw_json, '$.user.id') FROM events WHERE id = 1;
+```
+**Output:** `'101'`
+
+<br>
+
+**`FROM_JSON()`** — parses a JSON string into a typed struct/map
+```sql
+SELECT FROM_JSON(raw_json, 'user STRUCT<id:INT, name:STRING>') FROM events WHERE id = 1;
+```
+**Output:** `{user: {id: 101, name: 'Asha'}}` — a queryable struct, e.g. `.user.name`
+
+<br>
+
+**`TO_JSON()`** — converts a struct/map into a JSON string
+```sql
+SELECT TO_JSON(STRUCT(101 AS id, 'Asha' AS name));
+```
+**Output:** `'{"id":101,"name":"Asha"}'`
+
+<br>
+
+**`PARSE_JSON()`** — parses text into a semi-structured VARIANT value
+```sql
+SELECT PARSE_JSON('{"a":1}');
+```
+**Output:** VARIANT value, queryable as `result:a → 1`
+
+<br>
+
+**`SCHEMA_OF_JSON()`** — infers the schema of a JSON string
+```sql
+SELECT SCHEMA_OF_JSON('{"a":1,"b":"x"}');
+```
+**Output:** `'STRUCT<a: BIGINT, b: STRING>'`
+
+---
+
+## 13.3 Date & Time Functions
+
+**Sample table `orders_dates`**
+
+| id | order_date |
+|---|---|
+| 1 | 2026-01-15 |
+| 2 | 2026-08-30 |
+
+<br>
+
+**`DATE_TRUNC()`** — rounds a date/timestamp down to a unit (month, year, etc.)
+```sql
+SELECT DATE_TRUNC('MONTH', order_date) FROM orders_dates WHERE id = 2;
+```
+**Output:** `2026-08-01`
+
+<br>
+
+**`DATEDIFF()`** — number of days between two dates
+```sql
+SELECT DATEDIFF(o2.order_date, o1.order_date)
+FROM orders_dates o1, orders_dates o2
+WHERE o1.id = 1 AND o2.id = 2;
+```
+**Output:** `227`
+
+<br>
+
+**`DATE_ADD()` / `DATE_SUB()`** — adds/subtracts days from a date
+```sql
+SELECT DATE_ADD(order_date, 7) FROM orders_dates WHERE id = 1;
+```
+**Output:** `2026-01-22`
+
+<br>
+
+**`ADD_MONTHS()`** — adds N months to a date
+```sql
+SELECT ADD_MONTHS(order_date, 3) FROM orders_dates WHERE id = 1;
+```
+**Output:** `2026-04-15`
+
+<br>
+
+**`MONTHS_BETWEEN()`** — number of months between two dates
+```sql
+SELECT MONTHS_BETWEEN(o2.order_date, o1.order_date)
+FROM orders_dates o1, orders_dates o2
+WHERE o1.id = 1 AND o2.id = 2;
+```
+**Output:** `~7.5`
+
+<br>
+
+**`TO_DATE()`** — converts a string to a date using a format
+```sql
+SELECT TO_DATE('30-08-2026', 'dd-MM-yyyy');
+```
+**Output:** `2026-08-30`
+
+<br>
+
+**`UNIX_TIMESTAMP()`** — converts a timestamp to Unix epoch seconds
+```sql
+SELECT UNIX_TIMESTAMP(order_date) FROM orders_dates WHERE id = 1;
+```
+**Output:** `1768435200`
+
+<br>
+
+**`WINDOW()`** — buckets a timestamp into a fixed-size time window
+```sql
+SELECT WINDOW(order_date, '1 month') FROM orders_dates WHERE id = 1;
+```
+**Output:** `{start: 2026-01-01, end: 2026-02-01}`
+
+---
+
+## 13.4 Window / Ranking Functions
+
+**Sample table `employees`**
+
+| name | dept | salary |
+|---|---|---|
+| Asha | Sales | 90000 |
+| Bala | Sales | 90000 |
+| Chen | Sales | 75000 |
+| Divya | Eng | 110000 |
+
+<br>
+
+**`RANK()`** — ranks rows, leaving gaps after ties
+```sql
+SELECT name, salary, RANK() OVER (ORDER BY salary DESC) AS rnk FROM employees;
+```
+**Output:** `Divya=1, Asha=2, Bala=2, Chen=4` — jumps from 2 straight to 4
+
+<br>
+
+**`DENSE_RANK()`** — ranks rows with no gaps after ties
+```sql
+SELECT name, salary, DENSE_RANK() OVER (ORDER BY salary DESC) AS rnk FROM employees;
+```
+**Output:** `Divya=1, Asha=2, Bala=2, Chen=3`
+
+<br>
+
+**`ROW_NUMBER()`** — unique sequential number per partition
+```sql
+SELECT name, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM employees;
+```
+**Output:** `Sales → Asha=1, Bala=2, Chen=3` · `Eng → Divya=1`
+
+<br>
+
+**`NTILE(n)`** — splits rows into n roughly equal buckets
+```sql
+SELECT name, NTILE(2) OVER (ORDER BY salary DESC) AS bucket FROM employees;
+```
+**Output:** `Divya=1, Asha=1, Bala=2, Chen=2`
+
+<br>
+
+**`LAG()` / `LEAD()`** — accesses the previous/next row's value
+```sql
+SELECT name, salary, LAG(salary) OVER (ORDER BY salary) AS prev_salary FROM employees;
+```
+**Output:** `Chen=NULL, Asha/Bala=75000, Divya=90000`
+
+<br>
+
+**`FIRST_VALUE()`** — first value in a window frame
+```sql
+SELECT name, FIRST_VALUE(name) OVER (PARTITION BY dept ORDER BY salary DESC) AS top_earner FROM employees;
+```
+**Output:** every Sales row shows `'Asha'` (dept's highest earner)
+
+<br>
+
+**`PERCENTILE_CONT()`** — exact percentile (e.g. median)
+```sql
+SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY salary) FROM employees;
+```
+**Output:** `90000`
+
+---
+
+## 13.5 String Functions
+
+**Sample table `users`**
+
+| email | phone |
+|---|---|
+| asha@gmail.com | +91 98765-43210 |
+
+**Sample table `addresses`**
+
+| city | state | zip |
+|---|---|---|
+| Pune | MH | 411001 |
+
+<br>
+
+**`SPLIT()`** — splits a string into an array by delimiter
+```sql
+SELECT SPLIT('a,b,c', ',');
+```
+**Output:** `['a', 'b', 'c']`
+
+<br>
+
+**`CONCAT_WS()`** — joins strings with a separator, skipping NULLs
+```sql
+SELECT CONCAT_WS('-', city, state, zip) FROM addresses;
+```
+**Output:** `'Pune-MH-411001'`
+
+<br>
+
+**`REGEXP_EXTRACT()`** — pulls a substring matching a regex pattern
+```sql
+SELECT REGEXP_EXTRACT(email, '@(.+)', 1) FROM users;
+```
+**Output:** `'gmail.com'`
+
+<br>
+
+**`REGEXP_REPLACE()`** — replaces substrings matching a regex pattern
+```sql
+SELECT REGEXP_REPLACE(phone, '[^0-9]', '') FROM users;
+```
+**Output:** `'919876543210'`
+
+---
+
+## 13.6 NULL Handling & Casting
+
+**Sample table `orders_null`**
+
+| id | phone | alt_phone | discount | amount_str |
+|---|---|---|---|---|
+| 1 | NULL | '12345' | 0 | '12.50' |
+| 2 | '99999' | NULL | 5 | 'abc' |
+
+<br>
+
+**`COALESCE()`** — returns the first non-NULL value in a list
+```sql
+SELECT id, COALESCE(phone, alt_phone, 'N/A') AS best_phone FROM orders_null;
+```
+**Output:** `id 1 → '12345'` · `id 2 → '99999'`
+
+<br>
+
+**`NULLIF()`** — returns NULL if two expressions are equal
+```sql
+SELECT id, NULLIF(discount, 0) AS discount FROM orders_null;
+```
+**Output:** `id 1 → NULL` · `id 2 → 5`
+
+<br>
+
+**`TRY_CAST()`** — casts a value, returning NULL instead of erroring
+```sql
+SELECT id, TRY_CAST(amount_str AS DECIMAL(10,2)) AS amount FROM orders_null;
+```
+**Output:** `id 1 → 12.50` · `id 2 → NULL` (no error on `'abc'`)
+
+---
+
+## 13.7 Pivot / Unpivot
+
+**Sample table `sales_data`**
+
+| product | quarter | sales |
+|---|---|---|
+| Widget | Q1 | 100 |
+| Widget | Q2 | 150 |
+| Gadget | Q1 | 200 |
+
+<br>
+
+**`PIVOT()`** — rotates unique row values into columns
+```sql
+SELECT * FROM sales_data
+PIVOT (SUM(sales) FOR quarter IN ('Q1','Q2','Q3','Q4'));
+```
+**Output:**
+
+| product | Q1 | Q2 | Q3 | Q4 |
+|---|---|---|---|---|
+| Widget | 100 | 150 | NULL | NULL |
+| Gadget | 200 | NULL | NULL | NULL |
+
+<br>
+
+**`UNPIVOT()`** — converts columns back into rows
+```sql
+SELECT * FROM sales_data_wide
+UNPIVOT (sales FOR quarter IN (Q1, Q2, Q3, Q4));
+```
+**Output:** turns the wide table above back into `(product, quarter, sales)` rows
+
+---
+
+## 13.8 Delta Lake / Table Management Commands
+
+**Sample table `sales_delta`** — a Delta table that has gone through a few inserts and one merge (i.e. has version history).
+
+<br>
+
+**`MERGE INTO`** — upserts rows based on a match condition
+```sql
+MERGE INTO sales_delta t
+USING updates s
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET t.amount = s.amount
+WHEN NOT MATCHED THEN INSERT *;
+```
+**Effect:** existing `id`s get their `amount` updated; new `id`s get inserted — one upsert pass, no separate UPDATE + INSERT statements needed
+
+<br>
+
+**`IDENTITY`** — auto-increments a surrogate key
+```sql
+CREATE TABLE t (id BIGINT GENERATED ALWAYS AS IDENTITY, name STRING);
+INSERT INTO t (name) VALUES ('Asha'), ('Bala');
+```
+**Output:** `id` auto-fills as `1, 2` — you never pass it explicitly
+
+<br>
+
+**`VACUUM`** — reclaims storage by deleting old unreferenced files
+```sql
+VACUUM sales_delta RETAIN 168 HOURS;
+```
+**Effect:** deletes data files older than 7 days that no current table version references
+
+<br>
+
+**`OPTIMIZE ... ZORDER BY`** — compacts files and co-locates related data
+```sql
+OPTIMIZE sales_delta ZORDER BY (customer_id);
+```
+**Effect:** merges small files into larger ones and sorts data so queries filtering on `customer_id` scan far fewer files
+
+<br>
+
+**`DESCRIBE HISTORY`** — shows the table's version/audit log
+```sql
+DESCRIBE HISTORY sales_delta;
+```
+**Output:**
+
+| version | timestamp | operation |
+|---|---|---|
+| 0 | 2026-01-01 | CREATE TABLE |
+| 1 | 2026-01-05 | WRITE (INSERT) |
+| 2 | 2026-01-10 | MERGE |
+
+<br>
+
+**`VERSION AS OF`** — time-travel to read an older version
+```sql
+SELECT COUNT(*) FROM sales_delta VERSION AS OF 1;
+```
+**Output:** row count as it existed right after version 1, ignoring the later MERGE
+
+<br>
+
+**`RESTORE TABLE`** — rolls the table back to a previous version
+```sql
+RESTORE TABLE sales_delta TO VERSION AS OF 1;
+```
+**Effect:** the table's current state becomes identical to version 1
+
+<br>
+
+**`DEEP CLONE`** — creates a full independent copy of a table
+```sql
+CREATE TABLE sales_backup DEEP CLONE sales_delta;
+```
+**Effect:** `sales_backup` gets its own copy of both data files and metadata, fully independent of the source
+
+---
 
 ---
 
