@@ -15,8 +15,8 @@
 - **Tungsten:** off-heap binary memory (`UnsafeRow`), Whole-Stage Code Gen (fuses operators into one JVM function).
 - **Photon:** Databricks-only native **C++ vectorized** engine, transparent, falls back to JVM Spark for unsupported ops. Enabled at cluster level, not a Spark conf.
 - **Memory layout:** Reserved (~300MB) + User Memory + Spark Memory (shared Storage↔Execution pool; Execution can evict Storage).
-- **`repartition(n)`** = full shuffle, can increase partitions. **`coalesce(n)`** = no shuffle, decrease-only.
-- Target partition size: **100–200MB** uncompressed.
+- **`repartition(n)`** = full shuffle, can increase partitions. **`coalesce(n)`** = no shuffle, decrease-only. **`repartitionByRange(n, col)`** = range partitioner, contiguous value ranges per partition (good before range-filtered writes).
+- Target partition size: **100–200MB** uncompressed. Read-time split size: `spark.sql.files.maxPartitionBytes` (default 128MB).
 - **Join strategies:**
 
 | Strategy | When |
@@ -33,6 +33,7 @@ big.join(broadcast(small), "id")
 ```sql
 SELECT /*+ BROADCAST(t) */ ...   -- or MERGE(a,b) / SHUFFLE_HASH(a,b)
 ```
+- **Broadcast failure modes:** OOM (side too large) vs **timeout** (`spark.sql.broadcastTimeout`, default 300s — the broadcast side took too long to materialize, e.g. its own upstream shuffle). Different fixes: raise threshold/disable for OOM, raise `broadcastTimeout` for the timeout case.
 - **PySpark internals:** Py4J (driver↔JVM, not slow) vs Python worker IPC (pickling, slow for row UDFs). Fix: **Pandas UDFs** (Arrow-vectorized).
 - **Accumulators:** write-only counters to driver; exactly-once only inside **actions**, not transformations (retries can double-count).
 - **Broadcast variables:** read-only value cached once per executor (for UDF lookups).
@@ -48,6 +49,26 @@ SELECT /*+ BROADCAST(t) */ ...   -- or MERGE(a,b) / SHUFFLE_HASH(a,b)
 - **`mapPartitions`/`foreachPartition`:** run once **per partition** (not per row) — use for expensive setup (DB connections, model loading).
 - **Higher-order array functions** (no UDF needed): `F.transform`, `F.filter`, `F.aggregate`, `F.exists`, `F.forall`.
 - **Reading a plan (`.explain("formatted")`):** `*` prefix = Whole-Stage Code Gen active. `Exchange` = a shuffle (look here first for cost). `BroadcastExchange`/`BroadcastHashJoin` = one side broadcast, no shuffle. `SortMergeJoin` = both sides shuffled+sorted. `HashAggregate` (x2) = partial + final aggregation. `ColumnarToRow`/frequent Photon-node absence = query falling out of Photon. `PushedFilters` in a Scan = confirms pushdown reached the file scan.
+
+**Data Types & Casting:**
+
+| Type | Python | Notes |
+|---|---|---|
+| `StringType` | `str` | UTF-8 |
+| `ByteType`/`ShortType`/`IntegerType`/`LongType` | `int` | 1/2/4/8 bytes — widen for IDs that could overflow Int |
+| `FloatType`/`DoubleType` | `float` | Binary FP — **never** for money |
+| `DecimalType(p,s)` | `Decimal` | Exact fixed-point — **always** for currency |
+| `DateType`/`TimestampType`/`TimestampNTZType` | `date`/`datetime` | NTZ = no timezone conversion ever applied |
+| `ArrayType`/`MapType`/`StructType` | `list`/`dict`/nested | Complex/nested types |
+
+```python
+df.withColumn("id", F.col("id").cast("int"))                    # or cast(IntegerType())
+df.withColumn("price", F.col("price").cast(DecimalType(10, 2)))
+df.withColumn("d", F.to_date(F.col("s"), "yyyy-MM-dd"))          # always specify format explicitly
+```
+- **ANSI mode** (`spark.sql.ansi.enabled`, **default True** on modern DBR): invalid cast → **throws an error**. Legacy/False: invalid cast → silently returns `NULL`.
+- **`TRY_CAST(x AS type)`** always returns `NULL` on failure regardless of ANSI mode — safest choice for known-messy data instead of disabling ANSI globally (which also changes overflow/divide-by-zero behavior).
+- Casting Timestamp→Date silently drops time (never errors). Decimal precision-narrowing casts truncate, not round — `ROUND()` first if needed.
 
 ---
 
@@ -76,6 +97,7 @@ df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").sav
 | High-cardinality, evolving query patterns | **Liquid Clustering** (`CLUSTER BY`) — modern default |
 | Same join key reused repeatedly | Bucketing |
 
+- **Gotcha:** Delta only collects min/max stats for the **first 32 columns** by default (`delta.dataSkippingNumIndexedCols`). Z-Ordering column #40 on a wide table gives zero skipping benefit unless this is raised.
 ```python
 spark.read.format("delta").option("versionAsOf", 5).load(path)          # time travel
 spark.read.format("delta").option("timestampAsOf", "2024-01-01").load(path)
@@ -83,7 +105,7 @@ spark.sql("RESTORE TABLE t TO VERSION AS OF 5")
 ```
 - **CDF:** `ALTER TABLE t SET TBLPROPERTIES (delta.enableChangeDataFeed=true)` → read via `.option("readChangeFeed","true")`. Change types: `insert`, `update_preimage`, `update_postimage`, `delete`.
 - **Clone:** `SHALLOW CLONE` = metadata-only, zero-copy. `DEEP CLONE` = full physical copy.
-- **UniForm:** one Delta table, readable as Iceberg/Hudi too (`delta.universalFormat.enabledFormats`).
+- **UniForm:** one Delta table, readable as Iceberg/Hudi too (`delta.universalFormat.enabledFormats`). Distinct from a **native Iceberg-format UC managed table** (Iceberg as the primary format, not a Delta table with an overlay).
 - **Constraints/Generated/Identity columns:**
 ```sql
 ALTER TABLE t ADD CONSTRAINT positive_amount CHECK (amount > 0);
@@ -129,7 +151,7 @@ COPY INTO t FROM 's3://bucket/raw/' FILEFORMAT = JSON FORMAT_OPTIONS ('mergeSche
 
 ---
 
-## 4. Ingestion, Streaming, DLT & Kafka
+## 4. Ingestion, Streaming & Lakeflow Declarative Pipelines & Kafka
 
 **Auto Loader key options:**
 
@@ -154,17 +176,21 @@ COPY INTO t FROM 's3://bucket/raw/' FILEFORMAT = JSON FORMAT_OPTIONS ('mergeSche
 - **Idempotent append writes:** `.option("txnAppId", app_id).option("txnVersion", batch_id)` — Delta auto-skips a duplicate `(appId, version)` write, simpler than `MERGE` for pure appends.
 - **Monitoring:** `query.status` / `query.lastProgress` / `query.recentProgress` (rows/sec, batch duration); `StreamingQueryListener` for event-driven alerting (onQueryStarted/Progress/Terminated).
 
-**DLT:**
+**Lakeflow Declarative Pipelines** (formerly Delta Live Tables/DLT — old `dlt` code still runs, current API shown first):
 - **Pipeline modes:** Triggered (run once, process available data, stop — cheaper) vs Continuous (cluster stays up, lowest latency, higher cost).
-- **`dlt.apply_changes` (`APPLY CHANGES INTO`):** declarative CDC — replaces hand-written MERGE for SCD1/2 inside DLT. `keys`, `sequence_by`, `apply_as_deletes`, `stored_as_scd_type=1|2`.
+- **`apply_changes` (`APPLY CHANGES INTO`):** declarative CDC — replaces hand-written MERGE for SCD1/2. `keys`, `sequence_by`, `apply_as_deletes`, `stored_as_scd_type=1|2`.
 ```python
-@dlt.table
-@dlt.expect("valid_amount", "amount > 0")            # track & warn
-@dlt.expect_or_drop("valid_id", "id IS NOT NULL")     # drop bad rows
-@dlt.expect_or_fail("valid_currency", "...")          # halt pipeline
-def silver_orders(): return dlt.read_stream("bronze_orders")
+# Current: from pyspark import pipelines as dp
+@dp.table
+@dp.expect("valid_amount", "amount > 0")            # track & warn
+@dp.expect_or_drop("valid_id", "id IS NOT NULL")     # drop bad rows
+@dp.expect_or_fail("valid_currency", "...")          # halt pipeline
+def silver_orders(): return dp.read("bronze_orders")
+
+# Legacy (still works): import dlt; @dlt.table / @dlt.expect... / dlt.read_stream(...)
 ```
-Streaming Tables (incremental) / Materialized Views (managed aggregates) / Views (temp, pipeline-scoped).
+Rename map: `import dlt`→`from pyspark import pipelines as dp` | `@dlt.table`(stream)→`@dp.table` | `@dlt.table`(batch)→`@dp.materialized_view` | `@dlt.view`→`@dp.temporary_view` | `dlt.read_stream`/`dlt.read`→`dp.read`.
+Streaming Tables (incremental) / Materialized Views (managed aggregates) / Temporary Views (pipeline-scoped).
 
 **Kafka:**
 ```python
@@ -188,7 +214,7 @@ spark.readStream.format("kafka") \
 CREATE STORAGE CREDENTIAL cred WITH (AZURE_MANAGED_IDENTITY='...');
 CREATE EXTERNAL LOCATION loc URL 's3://bucket/' WITH (STORAGE CREDENTIAL cred);
 ```
-- **Managed table:** UC controls storage, `DROP TABLE` deletes data. **External table:** user-specified path, `DROP TABLE` keeps data.
+- **Managed table:** UC controls storage, `DROP TABLE` deletes data. **External table:** user-specified path, `DROP TABLE` keeps data. **Foreign table:** read-only, lives in an external system via Lakehouse Federation. **Temporary table:** session-scoped UC-managed table (SQL warehouses only) — distinct from a temp view (Module 9).
 - **Volumes** = governed non-tabular file access (`/Volumes/cat/schema/vol/...`). **Mounts are deprecated** (credential-based, no per-user audit) — use Volumes.
 ```sql
 ALTER TABLE t ALTER COLUMN ssn SET MASK mask_fn;           -- dynamic column masking
@@ -204,7 +230,7 @@ GRANT SELECT ON TABLE t TO `group`;
 
 ## 6. Production Ops, Orchestration & CI/CD
 
-- **Workflows:** multi-task DAGs, `dbutils.jobs.taskValues` to pass data between tasks, conditional/For-Each branching.
+- **Lakeflow Jobs** (formerly Databricks Workflows): multi-task DAGs, `dbutils.jobs.taskValues` to pass data between tasks, conditional/For-Each branching.
 - **Job cluster reuse:** same `job_cluster_key` across tasks = shared cluster, avoids repeated startup cost (trade-off: shared resources).
 - Task retries: `max_retries`, `min_retry_interval_millis`. **Partial run repair** reruns only failed tasks.
 - **DABs (`databricks.yml`):** IaC for jobs/pipelines. `databricks bundle validate/deploy/run -t <target>`.
@@ -215,6 +241,8 @@ dbutils.widgets.text("run_date", "2024-01-01"); dbutils.widgets.get("run_date")
 dbutils.notebook.run("/path/child", 600, {"key":"val"})   # separate job run, returns string
 # %run ./utils   -> textual include, shared context
 ```
+- **`display(df)` vs `.show()`:** `display()` is Databricks-notebook-only — interactive/sortable table + one-click charts, not part of core PySpark, won't work outside a notebook (e.g. `spark-submit`).
+- **DBFS paths:** `dbfs:/...` = Spark's own distributed I/O (`spark.read`, `dbutils.fs`). `/dbfs/...` = FUSE mount, for local/non-Spark-aware libs (`pandas.read_csv`, `open()`). Mixing them up is the classic "file not found" bug.
 - **Spark UI tabs:** Jobs (timeline bottleneck) / Stages (task skew, GC time, shuffle R/W) / SQL (physical plan) / Executors (spill, thread dumps).
 - **Testing:** `pytest` + local SparkSession fixture + `chispa.assert_df_equality`; mock `dbutils`.
 - **Auth methods:** PAT (dev/scripting, tied to a user) → OAuth U2M (interactive login) → **Service Principal + OAuth M2M** (recommended for CI/CD/production, not tied to a person).
@@ -254,6 +282,11 @@ model = mlflow.pyfunc.load_model("models:/m/Production")
 - **AutoML:** `automl.classify(dataset, target_col, timeout_minutes)` — generates baseline models + fully editable notebooks per trial, tracked in MLflow. A starting point, not a final answer.
 - **Marketplace:** discover/subscribe to third-party datasets & models via Delta Sharing — appears as a live governed UC table, no data movement.
 - **Pricing tiers:** Standard (core Spark/jobs, no UC) → Premium (Unity Catalog, RBAC, DBSQL) → Enterprise (+ advanced compliance/security). UC-dependent features assume **Premium+**.
+- **Lakebase:** fully managed Postgres OLTP, UC-integrated. Synced tables (UC→Lakebase, low-latency reads), Lakebase CDF (Postgres→Delta), git-like branches + point-in-time restore, autoscale/scale-to-zero. Use cases: app backend, online feature store, agent state/memory.
+- **Lakeflow Designer:** no-code drag-and-drop + natural-language pipeline builder — compiles to the same governed pipeline infra as hand-written code.
+- **Genie Code** (coding agent for notebooks) ≠ **AI/BI Genie** (NL-to-SQL for business users) — different products, same brand name.
+- **AI Runtime:** serverless GPU compute for DL training/inference. Pairs with Ray/TorchDistributor/DeepSpeed for the distributed-execution layer.
+- **AI Gateway:** governance layer in front of Model Serving endpoints — usage tracking, payload logging, rate limiting, works across Databricks-hosted and external/proxied models alike.
 
 ---
 
@@ -263,6 +296,10 @@ model = mlflow.pyfunc.load_model("models:/m/Production")
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 ```
+
+**Views:** Temp (`createOrReplaceTempView`, session-only) vs Global Temp (`createGlobalTempView`, cluster-wide via `global_temp.` db, dies on cluster restart) vs UC View (`CREATE VIEW catalog.schema.v`, permanent/governed)
+
+**`spark.catalog`:** `.listTables()`, `.tableExists()`, `.cacheTable()`/`.uncacheTable()`/`.isCached()`, `.clearCache()`, `.refreshTable()` (force-refresh after an external write to avoid stale cached metadata)
 
 **Select/Filter:** `.select()`, `.filter()`/`.where()`, `.isin()`, `.like()`, `.isNull()`/`.isNotNull()`, `.distinct()`, `.dropDuplicates([cols])`
 
@@ -309,7 +346,7 @@ SELECT * FROM t VERSION AS OF 3;  RESTORE TABLE t TO VERSION AS OF 3;
 |---|---|---|
 | CSV | `.option("header",True).option("multiLine",True).csv()` | `mode`: PERMISSIVE/DROPMALFORMED/FAILFAST |
 | JSON | `.option("multiLine",True).json()` | `from_json`/`to_json`/`get_json_object` for JSON-string columns |
-| Parquet/ORC | `.parquet()` / `.orc()` | Columnar, embedded schema |
+| Parquet/ORC | `.parquet()` / `.orc()` | Columnar, embedded schema. `.option("mergeSchema","true")` on plain Parquet unions differing schemas across files (distinct from Delta's write-side `mergeSchema`) |
 | Avro | `.format("avro")` | Kafka/Schema Registry standard |
 | binaryFile | `.format("binaryFile")` | Images/PDFs, raw bytes |
 | XML | `.format("xml").option("rowTag",...)` | needs spark-xml lib |

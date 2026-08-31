@@ -5,7 +5,7 @@
 1. [Module 1: Apache Spark Core & PySpark Internals](#module-1-apache-spark-core--pyspark-internals)
 2. [Module 2: Delta Lake Deep Dive & Storage Mechanics](#module-2-delta-lake-deep-dive--storage-mechanics)
 3. [Module 3: Compute Architecture, Cluster Sizing & Engine Optimization](#module-3-compute-architecture-cluster-sizing--engine-optimization)
-4. [Module 4: Ingestion Patterns, Structured Streaming & Delta Live Tables (DLT)](#module-4-ingestion-patterns-structured-streaming--delta-live-tables-dlt)
+4. [Module 4: Ingestion Patterns, Structured Streaming & Lakeflow Declarative Pipelines](#module-4-ingestion-patterns-structured-streaming--lakeflow-declarative-pipelines)
 5. [Module 5: Data Governance, Security & Unity Catalog](#module-5-data-governance-security--unity-catalog)
 6. [Module 6: Production Operations, Orchestration & CI/CD](#module-6-production-operations-orchestration--cicd)
 7. [Module 7: Lakehouse System Design, CDC & Troubleshooting Playbooks](#module-7-lakehouse-system-design-cdc--troubleshooting-playbooks)
@@ -271,6 +271,21 @@ target_partitions = total_data_size_mb // 150
 df = df.repartition(target_partitions)
 ```
 
+**`repartition()` vs `repartitionByRange()`** — both shuffle, but distribute differently:
+
+```python
+df.repartition(10, "customer_id")              # HASH partitioner - even row count per partition, but a range scan later still touches all partitions
+df.repartitionByRange(10, "order_date")         # RANGE partitioner - each partition holds a contiguous value range, ideal before range-filtered writes or sortBy-like access patterns
+```
+**Interview answer:** *"`repartition` uses a hash partitioner — great for equal-sized partitions and equality joins/groupBy, but a range filter (`WHERE order_date BETWEEN ...`) still has to scan every partition since values are scattered by hash. `repartitionByRange` groups contiguous value ranges into the same partition, which is what you want before writing data that will later be range-filtered or before a global sort."*
+
+**Read-time partition sizing** (controls how Spark splits *input* files into partitions, separate from `repartition`/`coalesce` which act on already-loaded DataFrames):
+
+```python
+spark.conf.set("spark.sql.files.maxPartitionBytes", 128 * 1024 * 1024)   # max bytes per input partition when reading (default 128MB)
+spark.conf.set("spark.sql.files.openCostInBytes", 4 * 1024 * 1024)       # estimated cost of opening a file, factored into how many small files get packed into one partition
+```
+
 ---
 
 ### 1.8 Distributed Join Internals
@@ -299,6 +314,13 @@ result.explain()
 ```python
 spark.conf.set("spark.sql.autoBroadcastJoinThreshold", 20 * 1024 * 1024)  # 20MB
 ```
+
+**Broadcast timeout — a failure mode distinct from broadcast OOM:** collecting and broadcasting the small side is itself a blocking operation with a time limit. A broadcast that's slow to materialize (e.g., an expensive filter/aggregation feeding it) can **time out** rather than run out of memory.
+
+```python
+spark.conf.set("spark.sql.broadcastTimeout", 600)   # seconds, default 300 (5 min)
+```
+**Interview answer:** *"OOM and timeout are two different broadcast join failure modes — OOM means the broadcast side turned out too large for memory; a timeout means the broadcast side was computing correctly but just took too long (often because it involves its own expensive upstream shuffle/aggregation). Raising `broadcastTimeout` fixes the second case; it does nothing for the first."*
 
 **SQL join hints** — the SQL-syntax equivalent of `broadcast()`, useful in `spark.sql()` string queries or when you want to force a specific strategy regardless of size estimates:
 
@@ -564,6 +586,102 @@ scored_rdd = df.rdd.mapPartitions(score_partition)
 **Interview answer:** *"`mapPartitions` amortizes expensive setup cost across an entire partition instead of paying it per row — it's the RDD-level equivalent of what a Pandas UDF gives you at the DataFrame level via batching."*
 
 ---
+
+### 1.16 PySpark Data Types & Casting Reference
+
+**Full `pyspark.sql.types` reference**
+
+```python
+from pyspark.sql.types import (
+    StringType, BinaryType, BooleanType, NullType,
+    ByteType, ShortType, IntegerType, LongType,          # integer family, by width
+    FloatType, DoubleType, DecimalType,                   # floating-point / fixed-precision
+    DateType, TimestampType, TimestampNTZType,            # date/time family
+    ArrayType, MapType, StructType, StructField           # complex/nested types
+)
+```
+
+| PySpark Type | Python Equivalent | Notes |
+|---|---|---|
+| `StringType` | `str` | UTF-8 text, no length limit |
+| `BinaryType` | `bytearray` | Raw bytes |
+| `BooleanType` | `bool` | True/False |
+| `ByteType` | `int` | 1 byte, range -128 to 127 |
+| `ShortType` | `int` | 2 bytes, range ±32,767 |
+| `IntegerType` | `int` | 4 bytes, range ±2.1 billion |
+| `LongType` | `int` | 8 bytes — use for IDs/counts that could exceed Integer range |
+| `FloatType` | `float` | 4-byte single precision — avoid for money/exact math |
+| `DoubleType` | `float` | 8-byte double precision — Spark's default for decimal literals unless specified |
+| `DecimalType(precision, scale)` | `decimal.Decimal` | Fixed-point, **exact** — always use for currency/financial calculations, never Float/Double |
+| `DateType` | `datetime.date` | Calendar date, no time component |
+| `TimestampType` | `datetime.datetime` | Instant with time, stored/interpreted relative to session timezone |
+| `TimestampNTZType` | `datetime.datetime` | "No Time Zone" — a wall-clock timestamp with **no** timezone conversion applied, ever (added to avoid timezone-conversion bugs) |
+| `ArrayType(elementType)` | `list` | Homogeneous list |
+| `MapType(keyType, valueType)` | `dict` | Key-value pairs |
+| `StructType([StructField(...)])` | nested object / `Row` | Nested schema, PySpark's equivalent of a JSON object |
+| `NullType` | `NoneType` | Type of a column that is always null (e.g., `F.lit(None)` with no other type hint) |
+
+**Interview answer (Decimal vs Double):** *"`DoubleType` is binary floating-point — it can't represent values like 0.1 exactly, which causes rounding errors that compound across many rows in a `SUM`. `DecimalType(precision, scale)` stores an exact fixed-point value, which is why it's mandatory for any financial/currency calculation — the classic interview trap is summing a `DoubleType` money column and getting a result off by a fraction of a cent."*
+
+---
+
+**Casting — syntax and behavior**
+
+```python
+from pyspark.sql.types import IntegerType, DoubleType, DecimalType
+
+# Three equivalent ways to cast
+df.withColumn("id", F.col("id").cast("int"))              # string type name
+df.withColumn("id", F.col("id").cast(IntegerType()))       # type object
+df.selectExpr("CAST(id AS INT) AS id")                     # SQL expression string
+
+# Decimal with explicit precision/scale (important for money columns)
+df.withColumn("price", F.col("price").cast(DecimalType(10, 2)))   # up to 10 digits total, 2 after the decimal
+```
+
+**Parsing strings into dates/timestamps with an explicit format** (never rely on implicit inference for production pipelines):
+
+```python
+df.withColumn("order_date", F.to_date(F.col("date_str"), "yyyy-MM-dd"))
+df.withColumn("order_ts", F.to_timestamp(F.col("ts_str"), "yyyy-MM-dd HH:mm:ss"))
+```
+
+**What happens when a cast fails — the ANSI mode distinction:**
+
+```python
+spark.conf.set("spark.sql.ansi.enabled", "true")   # Databricks default in modern DBR: True
+
+# With ANSI mode ON (default): an invalid cast RAISES AN EXCEPTION
+df.selectExpr("CAST('abc' AS INT)").show()   # throws NumberFormatException
+
+# With ANSI mode OFF (legacy Spark default): an invalid cast silently returns NULL
+spark.conf.set("spark.sql.ansi.enabled", "false")
+df.selectExpr("CAST('abc' AS INT)").show()   # returns NULL, no error
+
+# TRY_CAST always returns NULL on failure regardless of ANSI mode - the safe choice for messy data
+df.selectExpr("TRY_CAST('abc' AS INT) AS safe_cast").show()
+```
+
+**Interview answer:** *"Modern Databricks Runtime defaults to ANSI SQL mode, which means an invalid cast now throws an error instead of silently producing a NULL — this is a deliberate change from legacy Spark behavior to surface data quality problems early instead of masking them. If you genuinely want the old permissive behavior for known-messy input, use `TRY_CAST` explicitly rather than disabling ANSI mode globally, since disabling it also changes overflow and division-by-zero behavior for the whole session."*
+
+**Other common casting pitfalls:**
+
+```python
+# Integer overflow: casting a value too large for the target type
+spark.sql("SELECT CAST(99999999999 AS INT)")   # ANSI mode: error. Legacy mode: silently wraps/truncates - a classic silent-bug source
+
+# Precision loss casting Decimal to a smaller scale
+df.withColumn("rounded", F.col("price").cast(DecimalType(10, 0)))   # truncates cents - use ROUND() first if that's not intended
+
+# Casting Timestamp to Date drops the time component silently (this direction never errors)
+df.withColumn("date_only", F.col("event_ts").cast("date"))
+
+# Array/Map/Struct casts - only valid between compatible nested shapes
+df.withColumn("nums", F.col("string_array_col").cast(ArrayType(IntegerType())))
+```
+
+---
+
 ## Module 2: Delta Lake Deep Dive & Storage Mechanics
 
 ### 2.1 Transaction Log (`_delta_log`) Internals
@@ -701,6 +819,13 @@ CREATE TABLE sales_clustered (
 spark.sql("OPTIMIZE sales_clustered")   # re-clusters incrementally
 ```
 
+**The stats-collection column limit — a wide-table gotcha:** Delta only collects file-level min/max statistics for the **first 32 columns** of a table by default (`delta.dataSkippingNumIndexedCols`). On a very wide table, a Z-Order or filter on column #40 gets **zero data-skipping benefit** even if it's otherwise a perfect Z-Order candidate — the stats simply were never collected for it.
+
+```sql
+ALTER TABLE main.sales.wide_table SET TBLPROPERTIES ('delta.dataSkippingNumIndexedCols' = '50');
+```
+**Interview answer:** *"If someone Z-Orders a column and sees no scan improvement on a wide table, the first thing to check isn't the Z-Order itself — it's whether that column even falls within the indexed column limit. Reordering columns so frequently-filtered ones come first, or explicitly raising `dataSkippingNumIndexedCols`, fixes it."*
+
 ---
 
 ### 2.6 Time Travel & Metadata Recovery
@@ -767,6 +892,8 @@ ALTER TABLE my_table SET TBLPROPERTIES (
 )
 """)
 ```
+
+**Beyond UniForm — native Iceberg tables in Unity Catalog:** Unity Catalog managed tables now support Apache Iceberg as a **first-class storage format** directly, not only via UniForm's Delta-with-an-Iceberg-metadata-overlay approach. **Interview answer:** *"UniForm is for an existing Delta table that also needs to be readable by Iceberg-only tooling without duplicating data. A native Iceberg-format managed table is the choice when Iceberg itself — not Delta — is meant to be the primary format going forward, e.g., standardizing on Iceberg across a multi-engine environment where Delta-specific features aren't the point."*
 
 ---
 
@@ -1073,7 +1200,7 @@ pip install --upgrade some-python-package
 
 ---
 
-## Module 4: Ingestion Patterns, Structured Streaming & Delta Live Tables (DLT)
+## Module 4: Ingestion Patterns, Structured Streaming & Lakeflow Declarative Pipelines
 
 ### 4.1 Auto Loader (`cloudFiles`)
 
@@ -1236,18 +1363,44 @@ The checkpoint directory stores `offsets/` (what's been read), `commits/` (what'
 
 ---
 
-### 4.6 & 4.7 Delta Live Tables (DLT): Declarative Framework & Table Constructs
+### 4.6 & 4.7 Lakeflow Declarative Pipelines: Framework & Table Constructs
 
-**Pipeline execution modes** (a DLT pipeline-level setting, distinct from the streaming triggers above):
+**Naming note:** this was formerly called **Delta Live Tables (DLT)**. As of mid-2026 it's branded **Lakeflow Declarative Pipelines**, built on the newly open-sourced **Apache Spark Declarative Pipelines** (Spark 4.1+). Old `dlt`-based code keeps working unchanged — Databricks recommends the new API for new pipelines, but there's no forced migration. Classic SKUs and event log schemas still use the `dlt` name internally.
+
+**Pipeline execution modes** (a pipeline-level setting, distinct from the streaming triggers above):
 
 | Mode | Behavior |
 |---|---|
-| **Triggered** | Runs once, processes all currently available data, then stops — cheaper, good for scheduled/batch-like DLT pipelines |
+| **Triggered** | Runs once, processes all currently available data, then stops — cheaper, good for scheduled/batch-like pipelines |
 | **Continuous** | Keeps the pipeline's cluster running and processes new data as it arrives — lower latency, higher cost since compute never spins down |
 
 ```python
-import dlt
+# Current API (recommended for new pipelines)
+from pyspark import pipelines as dp
 from pyspark.sql.functions import col
+
+@dp.table(comment="Raw ingested events")
+def bronze_events():
+    return (spark.readStream.format("cloudFiles")
+            .option("cloudFiles.format", "json")
+            .load("dbfs:/raw/events/"))
+
+@dp.materialized_view(comment="Cleaned, deduplicated events")     # was a plain @dlt.table before
+def silver_events():
+    return (dp.read("bronze_events")
+            .dropDuplicates(["event_id"])
+            .filter(col("event_time").isNotNull()))
+
+@dp.materialized_view(comment="Daily aggregated metrics")
+def gold_daily_metrics():
+    return (dp.read("silver_events")
+            .groupBy("event_date")
+            .count())
+```
+
+```python
+# Legacy API (still fully supported, widely seen in existing pipelines/tutorials)
+import dlt
 
 @dlt.table(comment="Raw ingested events")
 def bronze_events():
@@ -1260,28 +1413,45 @@ def silver_events():
     return (dlt.read_stream("bronze_events")
             .dropDuplicates(["event_id"])
             .filter(col("event_time").isNotNull()))
-
-@dlt.table(comment="Daily aggregated metrics")
-def gold_daily_metrics():
-    return (dlt.read("silver_events")
-            .groupBy("event_date")
-            .count())
 ```
 
-- You declare **what** each table should contain; DLT compiles the dependency graph and DAG automatically (no manual orchestration).
-- **Streaming Tables**: incremental, append-oriented (`dlt.read_stream`).
-- **Materialized Views**: fully recomputed/maintained aggregates (`dlt.read`, plain `@dlt.table` without streaming source).
-- **Temporary Views**: `@dlt.view` — intermediate transformations not persisted as tables, scoped to the pipeline.
+**Key rename map (old → new):**
+
+| Legacy (`dlt`) | Current (`pyspark.pipelines as dp`) |
+|---|---|
+| `import dlt` | `from pyspark import pipelines as dp` |
+| `@dlt.table` (streaming source) | `@dp.table` |
+| `@dlt.table` (batch/aggregation) | `@dp.materialized_view` |
+| `@dlt.view` | `@dp.temporary_view` |
+| `dlt.read_stream(...)` | `dp.read(...)` |
+| `dlt.read(...)` | `dp.read(...)` |
+
+- You declare **what** each table should contain; the pipeline compiles the dependency graph and DAG automatically (no manual orchestration).
+- **Streaming Tables**: incremental, append-oriented (`@dp.table` / legacy `@dlt.table` with a streaming source).
+- **Materialized Views**: fully recomputed/maintained aggregates (`@dp.materialized_view` / legacy plain `@dlt.table` without a streaming source).
+- **Temporary Views**: `@dp.temporary_view` / legacy `@dlt.view` — intermediate transformations not persisted as tables, scoped to the pipeline.
 
 ---
 
-### 4.8 Data Quality Expectations in DLT
+### 4.8 Data Quality Expectations
 
 ```python
+# Current API
+from pyspark import pipelines as dp
+
+@dp.table
+@dp.expect("valid_amount", "amount > 0")                          # track & warn, keep row
+@dp.expect_or_drop("valid_id", "id IS NOT NULL")                  # drop bad rows silently
+@dp.expect_or_fail("valid_currency", "currency IN ('USD','EUR')")  # halt pipeline on violation
+def validated_orders():
+    return dp.read("bronze_orders")
+```
+```python
+# Legacy API (equivalent, still works)
 @dlt.table
-@dlt.expect("valid_amount", "amount > 0")                       # track & warn, keep row
-@dlt.expect_or_drop("valid_id", "id IS NOT NULL")                # drop bad rows silently
-@dlt.expect_or_fail("valid_currency", "currency IN ('USD','EUR')")  # halt pipeline on violation
+@dlt.expect("valid_amount", "amount > 0")
+@dlt.expect_or_drop("valid_id", "id IS NOT NULL")
+@dlt.expect_or_fail("valid_currency", "currency IN ('USD','EUR')")
 def validated_orders():
     return dlt.read_stream("bronze_orders")
 ```
@@ -1289,24 +1459,26 @@ def validated_orders():
 **Quarantine pattern**: route failing rows to a separate table instead of dropping them outright, so they can be inspected/reprocessed later.
 
 ```python
-@dlt.table
+@dp.table
 def orders_quarantine():
-    return (dlt.read_stream("bronze_orders")
+    return (dp.read("bronze_orders")
             .filter("amount <= 0 OR id IS NULL"))
 ```
 
 ---
 
-### 4.8b Declarative CDC in DLT: `APPLY CHANGES INTO`
+### 4.8b Declarative CDC: `APPLY CHANGES INTO`
 
-Module 7.2 showed **hand-written** `MERGE`-based SCD Type 1/2 logic. DLT has a **purpose-built declarative construct** for exactly this, so most teams shouldn't hand-write CDC MERGE logic inside a DLT pipeline at all.
+Module 7.2 showed **hand-written** `MERGE`-based SCD Type 1/2 logic. Lakeflow Declarative Pipelines has a **purpose-built declarative construct** for exactly this, so most teams shouldn't hand-write CDC MERGE logic inside a pipeline at all.
 
 ```python
-import dlt
+# Current API
+from pyspark import pipelines as dp
+from pyspark.sql import functions as F
 
-dlt.create_streaming_table("dim_customer_scd1")
+dp.create_streaming_table("dim_customer_scd1")
 
-dlt.apply_changes(
+dp.apply_changes(
     target="dim_customer_scd1",
     source="cdc_customer_changes",             # a streaming source of change events (e.g., from CDF or Debezium)
     keys=["customer_id"],
@@ -1316,22 +1488,26 @@ dlt.apply_changes(
     stored_as_scd_type=1                       # or 2 for full history tracking
 )
 ```
+```python
+# Legacy API (equivalent, still works): dlt.apply_changes(...) with identical arguments
+```
 
-For **SCD Type 2**, the only change is `stored_as_scd_type=2` — DLT automatically manages `__START_AT`/`__END_AT` columns tracking validity periods, without you writing any `is_current`/`whenMatchedUpdate` logic yourself.
+For **SCD Type 2**, the only change is `stored_as_scd_type=2` — the pipeline automatically manages `__START_AT`/`__END_AT` columns tracking validity periods, without you writing any `is_current`/`whenMatchedUpdate` logic yourself.
 
-**Interview answer:** *"`APPLY CHANGES INTO` (the `dlt.apply_changes` Python API) replaces hand-written `MERGE` logic for CDC inside a DLT pipeline. It handles out-of-order change events via `sequence_by`, supports both SCD Type 1 and Type 2 with a single parameter flip, and manages the historical tracking columns automatically for Type 2 — the Module 7.2 manual MERGE pattern is what you'd reach for **outside** DLT, in a plain Structured Streaming or batch job."*
+**Interview answer:** *"`apply_changes` (the declarative CDC API, `dp.apply_changes` today / `dlt.apply_changes` in legacy code) replaces hand-written `MERGE` logic for CDC inside a pipeline. It handles out-of-order change events via `sequence_by`, supports both SCD Type 1 and Type 2 with a single parameter flip, and manages the historical tracking columns automatically for Type 2 — the Module 7.2 manual MERGE pattern is what you'd reach for **outside** a declarative pipeline, in a plain Structured Streaming or batch job."*
 
 ---
 
-### 4.9 DLT Observability & Maintenance
+### 4.9 Observability & Maintenance
 
 ```python
 # Query the pipeline event log for data quality metrics, lineage, and run history
+# (event log schema still uses "dlt" internally even under the new branding)
 event_log_df = spark.read.format("delta").load("dbfs:/pipelines/<pipeline-id>/system/events")
 event_log_df.selectExpr("details:flow_progress.data_quality").show(truncate=False)
 ```
 
-DLT pipelines automatically run `VACUUM`/`OPTIMIZE` on managed tables as part of their maintenance cycle — no manual scheduling needed.
+Pipelines automatically run `VACUUM`/`OPTIMIZE` on managed tables as part of their maintenance cycle — no manual scheduling needed.
 
 ---
 
@@ -1613,20 +1789,26 @@ This separates *who can access which cloud path* from the *table definition itse
 
 ---
 
-### 5.3 Table Lifecycles: Managed vs External
+### 5.3 Table Lifecycles: Managed, External, Foreign & Temporary
 
-| | Managed Table | External Table |
-|---|---|---|
-| Storage location | Controlled by Unity Catalog | User-specified path |
-| `DROP TABLE` | Deletes underlying data too | Only removes metadata, data stays |
-| Use case | Standard governed tables | Data shared with other tools/systems |
+| | Managed Table | External Table | Foreign Table | Temporary Table |
+|---|---|---|---|---|
+| Storage location | Controlled by Unity Catalog | User-specified path | Lives in an external system entirely | Session-scoped, UC-managed |
+| `DROP TABLE` | Deletes underlying data too | Only removes metadata, data stays | Only removes the UC pointer, source system untouched | N/A — expires with the session |
+| Use case | Standard governed tables | Data shared with other tools/systems | Read-only access to an external database via Lakehouse Federation (Module 8.6) | Intermediate data in a SQL warehouse session, without persisting a real table |
 
 ```sql
 CREATE TABLE main.sales.orders (id INT, amount DOUBLE);              -- Managed
 
 CREATE TABLE main.sales.orders_ext (id INT, amount DOUBLE)
 LOCATION 's3://my-bucket/orders/';                                    -- External
+
+-- Foreign table: created implicitly once a Lakehouse Federation connection + foreign catalog exist (Module 8.6)
+SELECT * FROM pg_catalog.public.orders;                               -- Foreign
+
+CREATE TEMPORARY TABLE staging_calc AS SELECT * FROM main.sales.orders WHERE amount > 100;   -- Temporary (SQL warehouses only)
 ```
+**Interview answer:** *"A foreign table is the specific term for what a Lakehouse Federation connection exposes — it looks like a normal queryable table but every read goes back to the live external system, there's no data copy. A temporary table is different again from a temp view (Module 9.1b) — it's a real, if short-lived, Unity Catalog managed table, scoped to the current SQL warehouse session, useful for genuinely materializing an intermediate result rather than just aliasing a query."*
 
 ---
 
@@ -1768,7 +1950,7 @@ databricks secrets create-scope my-akv-scope \
 
 ## Module 6: Production Operations, Orchestration & CI/CD
 
-### 6.1 Databricks Workflows
+### 6.1 Lakeflow Jobs (formerly Databricks Workflows)
 
 ```python
 # Passing values between tasks in a multi-task job
@@ -1778,7 +1960,7 @@ dbutils.jobs.taskValues.set(key="row_count", value=df.count())
 count = dbutils.jobs.taskValues.get(taskKey="upstream_task", key="row_count", default=0)
 ```
 
-Workflows support **conditional branching** (If/Else tasks based on task outcomes) and **For-Each** tasks (looping a task template over a list of parameters), all defined as a DAG of tasks across notebooks, Python scripts, SQL, DLT pipelines, and dbt.
+Jobs support **conditional branching** (If/Else tasks based on task outcomes) and **For-Each** tasks (looping a task template over a list of parameters), all defined as a DAG of tasks across notebooks, Python scripts, SQL, Lakeflow Declarative Pipelines, and dbt.
 
 **Job cluster reuse** — a cost-efficiency detail worth knowing: by default, each task in a multi-task job can spin up its *own* job cluster, meaning startup time (and cost) is paid repeatedly. Assigning multiple tasks the **same `job_cluster_key`** makes them share a single cluster across the whole job run instead.
 
@@ -1891,6 +2073,30 @@ dbutils.notebook.exit("SUCCESS")   # return a value to the caller
 ```
 
 **`%run` vs `dbutils.notebook.run()`:** `%run` textually includes the other notebook (shares variables/session, runs in the same Spark context) — used for shared utility functions. `dbutils.notebook.run()` executes the target notebook as a **separate job run** with its own context, returns only a string exit value, and supports timeouts/parameters — used for actual orchestration/modularity.
+
+**`display()` vs `.show()`**
+
+```python
+df.show()          # plain PySpark - static text table, truncates long values, fixed row count
+display(df)        # Databricks-only notebook function - rich, sortable/scrollable HTML table, built-in charting UI, works on DataFrames AND plain Python collections/plots
+```
+**Interview answer:** *"`.show()` is standard PySpark and works anywhere Spark runs. `display()` is a Databricks notebook-only convenience function — it renders an interactive, sortable table with a one-click chart builder, and it isn't part of the Spark API itself, so code using `display()` needs adjusting (back to `.show()` or `print()`) if it's ever run outside a Databricks notebook context, e.g. in a plain `spark-submit` script."*
+
+**DBFS path conventions — a common source of "file not found" confusion**
+
+| Path style | Used by | Example |
+|---|---|---|
+| `dbfs:/...` | Spark's distributed readers/writers (`spark.read`, `dbutils.fs`) | `spark.read.csv("dbfs:/data/file.csv")` |
+| `/dbfs/...` | Local, single-machine file APIs — Python's `open()`, `pandas.read_csv()`, `os` module | `pd.read_csv("/dbfs/data/file.csv")` |
+
+```python
+# WRONG - pandas doesn't understand the dbfs:/ URI scheme, it expects a local filesystem path
+pd.read_csv("dbfs:/data/file.csv")     # raises FileNotFoundError
+
+# RIGHT - the /dbfs/ FUSE mount exposes DBFS as if it were a local directory
+pd.read_csv("/dbfs/data/file.csv")
+```
+**Interview answer:** *"`dbfs:/` is a URI scheme Spark's own distributed I/O understands. `/dbfs/` is a FUSE mount that exposes the same underlying storage as an ordinary local path, which is what any single-machine, non-Spark-aware library (pandas, plain Python `open()`) needs. Mixing the two up is one of the most common 'file not found' errors for people new to Databricks — Spark and pandas are talking to the same data, just through two different path conventions."*
 
 ---
 
@@ -2386,7 +2592,7 @@ These are typically **Solutions Architect / Platform Engineer** interview topics
 
 | | Databricks Asset Bundles (DABs) | Databricks Terraform Provider |
 |---|---|---|
-| Scope | Jobs, pipelines, DLT, ML resources — app-level | Full workspace/account-level infra (clusters, users, catalogs, workspaces themselves) |
+| Scope | Jobs, pipelines (Lakeflow Declarative Pipelines), ML resources — app-level | Full workspace/account-level infra (clusters, users, catalogs, workspaces themselves) |
 | Owned by | Databricks-native CLI tool | HashiCorp Terraform ecosystem |
 | Best for | CI/CD of a specific data project's jobs/pipelines | Provisioning the platform itself (new workspaces, Unity Catalog metastores, network config) |
 | Typical user | Data engineer / ML engineer | Platform / DevOps engineer |
@@ -2438,7 +2644,7 @@ w.quality_monitors.create(
 - Automatically generates **profile metrics** (nulls, distinct counts, distributions per column) and **drift metrics** (comparing the current window against a baseline or previous window) into two auto-created Delta tables you can query or build dashboards/alerts on top of.
 - Three monitor types: **Snapshot** (point-in-time tables), **Time Series** (tables with a timestamp column, tracks metrics over time), **Inference Log** (ML model input/output tables — tracks prediction drift and label drift for deployed models).
 
-**Interview answer:** *"Lakehouse Monitoring is Databricks' answer to hand-rolled data quality frameworks (like Great Expectations) for the specific case of ongoing drift/quality tracking on a table already in Unity Catalog — it's complementary to DLT Expectations (Module 4.8), which validate rows at ingestion time, whereas Monitoring tracks aggregate statistical health of a table over time."*
+**Interview answer:** *"Lakehouse Monitoring is Databricks' answer to hand-rolled data quality frameworks (like Great Expectations) for the specific case of ongoing drift/quality tracking on a table already in Unity Catalog — it's complementary to the Expectations in Lakeflow Declarative Pipelines (Module 4.8), which validate rows at ingestion time, whereas Monitoring tracks aggregate statistical health of a table over time."*
 
 ---
 
@@ -2483,6 +2689,64 @@ Not itself a technical concept, but a genuinely common "gotcha" in system-design
 
 ---
 
+### 8.14 Lakebase — Managed Postgres OLTP
+
+A **fully managed Postgres database** built into the Databricks platform — Databricks' answer to needing a genuine low-latency **transactional** (OLTP) store alongside the lakehouse's analytical (OLAP) strength, rather than forcing every workload through Delta/Spark.
+
+```sql
+-- Register a Lakebase database in Unity Catalog for unified governance
+-- (managed via the UI/API; once registered it's addressable like any other UC-governed asset)
+```
+
+- **Sync Unity Catalog tables into Lakebase** ("synced tables") so a low-latency application can query lakehouse data at millisecond latency instead of querying Delta/Spark directly.
+- **Lakebase Change Data Feed**: captures row-level Postgres changes as Delta tables for downstream pipelines/audit — the same CDF concept from Module 2.7, running in the opposite direction (OLTP → lakehouse).
+- **Branches & instant restore**: git-like branching for a database (isolated dev/test branches), plus point-in-time restore by branching from any moment in the retention window.
+- **Autoscaling & scale-to-zero**: compute scales with load and suspends entirely when idle.
+- **Use cases**: backend for Databricks Apps or any external app needing transactional writes, an **online feature store** for Model Serving (an alternative to the DynamoDB/Cosmos-style online store from Module 8.2), and durable **agent state/memory** storage for LangGraph/OpenAI Agents SDK-based agents.
+
+**Interview answer:** *"Delta Lake and Spark are built for large-scale analytical (OLAP) workloads, not the small, frequent, low-latency read/write transactions an application backend needs. Lakebase closes that gap with a real Postgres engine natively integrated into Unity Catalog governance — so instead of standing up and separately governing an external RDS/Cloud SQL instance, the transactional tier lives inside the same platform and can sync data both directions with the lakehouse."*
+
+---
+
+### 8.15 Lakeflow Designer
+
+A **no-code / natural-language** visual data preparation tool — build transformation pipelines via a drag-and-drop canvas, or generate/update them from natural-language prompts through **Genie Code** (Module 8.16). Every visual pipeline compiles down to production-ready code governed by Unity Catalog, same as a hand-written pipeline — it's a different authoring surface, not a different execution engine.
+
+**Interview framing:** *"Lakeflow Designer targets the analyst/citizen-integrator persona who wants to build an ingestion or transformation flow without writing PySpark — but because it compiles to the same governed pipeline infrastructure underneath, it doesn't create a separate, ungoverned shadow-IT pipeline the way an external no-code tool might."*
+
+---
+
+### 8.16 Genie Code
+
+An **AI coding agent** embedded in Databricks notebooks for data science and engineering work — distinct from **AI/BI Genie** (Module 8.5's natural-language-to-SQL interface for business users querying governed tables). Genie Code helps write/iterate on notebook code itself: exploring a dataset, drafting a model, or updating a Lakeflow Designer flow from a plain-English instruction.
+
+**Interview answer:** *"There are two different products both called 'Genie' worth keeping straight: AI/BI Genie turns a business user's natural-language question into governed SQL against Unity Catalog tables. Genie Code is a coding assistant for the person actually writing notebook code — the audience and the artifact it produces are different, even though both are natural-language-driven."*
+
+---
+
+### 8.17 AI Runtime & Distributed Training
+
+**AI Runtime** provides **serverless GPU compute** for custom deep-learning training and inference, removing the need to manually provision/manage GPU clusters for these workloads. Complementary tools:
+
+```python
+# Distributed training approaches on Databricks (conceptual - library-specific APIs vary)
+# - Ray on Databricks: general distributed compute framework for ML workloads
+# - TorchDistributor: distributes PyTorch training across a Spark cluster's workers
+# - DeepSpeed: memory-optimized distributed training for very large models
+```
+
+**Interview answer:** *"AI Runtime is the serverless GPU layer — you get GPU compute without sizing/managing a GPU cluster yourself. Ray, TorchDistributor, and DeepSpeed are the distributed-training frameworks that actually parallelize a training job across that compute; AI Runtime is about *provisioning*, they're about *execution strategy*, and they're used together."*
+
+---
+
+### 8.18 AI Gateway
+
+A **governance layer in front of Model Serving endpoints** (Module 8.3) — adds usage tracking, payload logging, rate limiting, and centralized access control across every model endpoint (including external/third-party model providers proxied through Databricks), so model access is governed the same consistent way regardless of which model or provider sits behind it.
+
+**Interview answer:** *"Model Serving handles hosting and scaling a model behind an endpoint. AI Gateway sits in front of that (or in front of external provider endpoints) to answer a different set of questions — who's calling this model, how much are they using, what's actually being sent/returned for compliance logging — the same separation of concerns as an API gateway in front of any set of backend services."*
+
+---
+
 ## Module 9: PySpark & SQL Command/Function Cookbook
 
 A quick-reference cookbook of the functions and commands you'll actually type in an interview live-coding round. Import assumed for all examples:
@@ -2517,6 +2781,38 @@ df.schema
 df.columns
 df.dtypes
 ```
+
+### 9.1b Views & the `spark.catalog` API
+
+**Temp View vs Global Temp View vs a permanent Unity Catalog view:**
+
+| | `createOrReplaceTempView` | `createGlobalTempView` | UC View (`CREATE VIEW`) |
+|---|---|---|---|
+| Scope | Current `SparkSession` only | All sessions on the same cluster, under the `global_temp` database | Permanent, governed, cross-session/cross-cluster |
+| Lifetime | Dies with the session/notebook detach | Dies when the cluster restarts | Persists indefinitely until dropped |
+| Access | `spark.sql("SELECT * FROM my_temp_view")` | `spark.sql("SELECT * FROM global_temp.my_view")` (namespace required) | `spark.sql("SELECT * FROM main.sales.my_view")` |
+
+```python
+df.createOrReplaceTempView("my_temp_view")          # this session/notebook only
+df.createGlobalTempView("my_global_view")            # shared across notebooks on the same cluster
+spark.sql("CREATE VIEW main.sales.my_view AS SELECT * FROM main.sales.orders WHERE amount > 100")   # permanent, UC-governed
+```
+
+**`spark.catalog` API** — programmatic table/cache management without writing raw SQL:
+
+```python
+spark.catalog.listDatabases()
+spark.catalog.listTables("main.sales")
+spark.catalog.tableExists("main.sales.orders")
+spark.catalog.cacheTable("main.sales.orders")        # SQL-level cache, distinct from df.cache()
+spark.catalog.isCached("main.sales.orders")
+spark.catalog.uncacheTable("main.sales.orders")
+spark.catalog.clearCache()                            # uncache everything
+spark.catalog.refreshTable("main.sales.orders")       # force-refresh cached metadata (e.g., after an external write)
+```
+**Interview answer:** *"`refreshTable` matters more than it looks — if a Delta table was modified by something outside the current Spark session (another job, a direct file write), a session that already cached that table's metadata can serve stale results until you explicitly `refreshTable` or `clearCache`."*
+
+---
 
 ### 9.2 Column Selection & Filtering
 
@@ -2864,6 +3160,15 @@ avro_schema = open("/dbfs/schemas/event.avsc").read()
 df = spark.read.format("avro").option("avroSchema", avro_schema).load("dbfs:/data/events.avro")
 ```
 Avro is the standard interchange format with **Kafka + Schema Registry** pipelines — expect a question on why Avro (compact binary, embedded schema, strong schema-evolution support) is preferred over JSON for high-throughput streaming ingestion.
+
+**Reading multiple Parquet files with evolving schemas — a different `mergeSchema` than Delta's:**
+
+```python
+# Plain Parquet (NOT Delta) - if different files under the path have different (compatible) schemas,
+# this unions all discovered columns into one schema instead of failing or silently dropping columns
+df = spark.read.option("mergeSchema", "true").parquet("dbfs:/data/parquet_folder/")
+```
+**Interview answer:** *"This is a distinct concept from Delta's `mergeSchema` write option (Module 2.3) even though the option name is identical — this one is a **read-time** option for plain Parquet files, used when a folder contains files written at different points in time with slightly different schemas (e.g., a new column added later). Without it, Spark infers the schema from a sample of files and can silently miss columns that only exist in files it didn't sample."*
 
 **ORC**
 
