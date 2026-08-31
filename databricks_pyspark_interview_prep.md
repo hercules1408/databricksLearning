@@ -2574,7 +2574,58 @@ OPTIONS (database 'sales_db');
 SELECT * FROM pg_catalog.public.orders LIMIT 10;
 ```
 
-Query pushdown happens where possible (filters/aggregations pushed to the source system), and results are governed by the same Unity Catalog permission model as native Delta tables — useful for one-off joins against operational systems without building a full ingestion pipeline first.
+**Connection setup for other common sources** — the pattern is identical, only `TYPE` and connection-specific options change:
+
+```sql
+CREATE CONNECTION sf_connection TYPE SNOWFLAKE
+OPTIONS (host 'myaccount.snowflakecomputing.com', port '443', sfWarehouse 'compute_wh', user 'reader', password secret('scope','sf_pwd'));
+CREATE FOREIGN CATALOG sf_catalog USING CONNECTION sf_connection OPTIONS (database 'ANALYTICS');
+
+CREATE CONNECTION mysql_connection TYPE MYSQL
+OPTIONS (host 'mysql.company.com', port '3306', user 'reader', password secret('scope','mysql_pwd'));
+CREATE FOREIGN CATALOG mysql_catalog USING CONNECTION mysql_connection OPTIONS (database 'app_db');
+
+CREATE CONNECTION sqlserver_connection TYPE SQLSERVER
+OPTIONS (host 'sqlserver.company.com', port '1433', user 'reader', password secret('scope','sql_pwd'));
+CREATE FOREIGN CATALOG sqlserver_catalog USING CONNECTION sqlserver_connection OPTIONS (database 'orders_db');
+```
+
+**The actual "federation query" scenario — joining foreign data with native Delta data in one query:**
+
+```sql
+-- Enrich a live operational Postgres table with governed lakehouse dimension data,
+-- with no ETL pipeline built to copy either side first
+SELECT o.order_id, o.amount, d.customer_segment
+FROM pg_catalog.public.orders o                     -- foreign table (live Postgres)
+JOIN main.sales.dim_customer d                       -- native Delta table
+  ON o.customer_id = d.customer_id
+WHERE o.order_date >= current_date() - INTERVAL 7 DAYS;
+```
+
+```python
+# Same federated join from PySpark - a foreign catalog table is addressed exactly like any UC table
+df = spark.sql("""
+    SELECT o.order_id, o.amount, d.customer_segment
+    FROM pg_catalog.public.orders o
+    JOIN main.sales.dim_customer d ON o.customer_id = d.customer_id
+""")
+
+# Or via the DataFrame reader directly against the foreign catalog table
+foreign_df = spark.table("pg_catalog.public.orders")
+```
+
+**Verifying pushdown actually happened:**
+
+```sql
+EXPLAIN SELECT * FROM pg_catalog.public.orders WHERE amount > 1000;
+-- Look for the filter appearing inside the source-system query sent to Postgres,
+-- rather than "amount > 1000" showing up as a separate Spark-side Filter node
+-- applied AFTER the full table was pulled across
+```
+
+**Interview answer:** *"The interesting case interviewers actually probe for isn't the single-table read — it's a query joining a foreign table to a native Delta table in one statement, because Unity Catalog governs both sides identically even though the data physically lives in two completely different systems. Pushdown is the other thing to call out explicitly: filters and aggregations get pushed into the source system's own query engine where possible, so `WHERE amount > 1000` runs inside Postgres, not after pulling the whole table across the network into Spark — but pushdown support varies by connector and by expression complexity, which is worth checking via `EXPLAIN` rather than assuming."*
+
+**Limitation worth stating:** Lakehouse Federation is fundamentally **read-only** — it's for querying external systems from the lakehouse, not for writing back to them. A workflow that needs to write to the external system needs its own JDBC write path or the external system's own tooling, not a federation connection.
 
 ---
 
