@@ -148,6 +148,7 @@ COPY INTO t FROM 's3://bucket/raw/' FILEFORMAT = JSON FORMAT_OPTIONS ('mergeSche
 - **Cluster Policies** = restrict what users CAN launch (governance). **Instance Pools** = pre-warmed VMs, faster cluster START (not a perf feature for running jobs).
 - **Init scripts:** custom shell setup at cluster start (OS packages, JARs).
 - **DBR variants:** Standard / ML Runtime (pre-installed ML libs) / Photon (checkbox on top) / LTS (extended support).
+- **Control Plane vs Compute Plane:** Control plane = Databricks-managed backend (UI, APIs, scheduler, cluster manager) — never touches customer data. **Classic** compute plane = runs inside customer's own cloud subscription (VNet/VPC) — enables VNet injection. **Serverless** compute plane = runs in a Databricks-managed account, network-isolated per customer — enables near-instant startup, less direct customer network control.
 
 ---
 
@@ -274,7 +275,7 @@ model = mlflow.pyfunc.load_model("models:/m/Production")
 - **Model Serving:** managed REST endpoints, scale-to-zero. **Traffic splitting** across model versions (`traffic_config` with `traffic_percentage` per served entity) enables A/B testing & canary rollouts on one endpoint.
 - **Vector Search:** `create_delta_sync_index` — auto-synced embedding index for RAG; typical flow: Delta text chunks → embeddings → Vector Search → LLM context.
 - **DBSQL:** Classic/Serverless/Pro Warehouses, Photon-accelerated. **Genie** = NL-to-SQL over governed UC tables.
-- **Lakehouse Federation:** query external DBs (Postgres, Snowflake, etc.) live through UC, no ETL copy — `CREATE CONNECTION` / `CREATE FOREIGN CATALOG`.
+- **Lakehouse Federation — two distinct mechanisms:** **Query Federation** = JDBC pushdown to live operational DBs (MySQL/Postgres/Snowflake/Redshift/Teradata/Oracle/SQL Server/Synapse/BigQuery/Salesforce Data 360/another Databricks metastore), runs partly on remote compute. **Catalog Federation** = direct object-storage reads via an external catalog service (Hive Metastore/Glue/Snowflake catalog/OneLake), runs entirely on Databricks compute — cheaper/faster since no remote engine involved. Both: `CREATE CONNECTION` + `CREATE FOREIGN CATALOG`, both **read-only**, both **no result caching**. The real interview scenario is a JOIN between a foreign table and a native Delta table in one query.
 - **AI Functions (SQL):** `ai_query()`, `ai_classify()`, `ai_translate()`, `ai_summarize()`, `ai_extract()` — inline LLM calls in SQL, governed like any query.
 - **Lakehouse Monitoring:** auto profile + drift metrics on a table (Snapshot / Time Series / Inference Log monitors).
 - **Networking:** VNet Injection/Customer-Managed VPC + PrivateLink (private control↔compute↔storage traffic).
@@ -404,7 +405,7 @@ SELECT * FROM t VERSION AS OF 3;  RESTORE TABLE t TO VERSION AS OF 3;
 | Why `ANALYZE TABLE`? | Populates stats for CBO join reordering |
 | MLflow Tracking vs Registry? | Log runs vs manage model lifecycle stages |
 | Feature Store purpose? | One feature definition, reused train+serve |
-| Lakehouse Federation? | Query external DBs live via UC, no ETL copy |
+| Lakehouse Federation? | Two kinds: Query Federation (JDBC pushdown to live DBs) vs Catalog Federation (direct object-storage read via external catalog, no remote engine) — both read-only, no query caching |
 | DABs vs Terraform? | App-level CI/CD vs platform-level infra IaC |
 | Kafka delivery guarantee? | At-least-once; effective exactly-once needs idempotent sink |
 | Mounts vs UC Volumes? | Credential-based/legacy vs identity-governed/current |

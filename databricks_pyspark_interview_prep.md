@@ -1200,6 +1200,34 @@ pip install --upgrade some-python-package
 
 ---
 
+### 3.12 Databricks Architecture: Control Plane vs Compute Plane
+
+A foundational architecture question, distinct from Spark's own Driver/Executor model (Module 1.1) — this is about **where Databricks-the-platform's pieces physically live**, not about how a single Spark job executes.
+
+| | Control Plane | Compute Plane |
+|---|---|---|
+| What lives here | Databricks-managed backend: web app/UI, REST APIs, job scheduler, cluster manager, notebook storage, workspace metadata | Where your actual data is processed — the Spark driver/executors run here |
+| Who's account | Databricks' own cloud account | Depends on compute type — see below |
+| Sees customer data? | No (by default) — only metadata/control signals | Yes — this is where data is actually read/transformed |
+
+**Two flavors of compute plane:**
+
+```
+Classic compute plane:
+  - Runs INSIDE the customer's own cloud subscription (their VPC/VNet)
+  - Databricks provisions VMs there on the customer's behalf
+  - Customer has direct network-level visibility/control (security groups, subnets, peering)
+
+Serverless compute plane:
+  - Runs inside a Databricks-managed account, NOT the customer's subscription
+  - Network-isolated per customer via internal boundaries (still not shared compute across customers)
+  - Customer gets less direct network control in exchange for the fast-start, no-provisioning experience (Module 3.8)
+```
+
+**Interview answer:** *"Every Databricks deployment splits into a control plane, which Databricks operates and which never touches customer data directly, and a compute plane, which is where Spark actually runs and where customer data gets processed. The classic compute plane sits inside the customer's own cloud account — which is why VNet injection / Customer-Managed VPC (Module 8.7) is possible there, since the customer owns that network. The serverless compute plane instead runs in a Databricks-managed account, which is what makes serverless's near-instant startup possible — there's no customer-subscription VM provisioning step at all — at the cost of the customer having less direct network-level control over that specific compute layer, which is exactly the trade-off PrivateLink and per-customer network isolation exist to address."*
+
+---
+
 ## Module 4: Ingestion Patterns, Structured Streaming & Lakeflow Declarative Pipelines
 
 ### 4.1 Auto Loader (`cloudFiles`)
@@ -2561,7 +2589,18 @@ ORDER BY total_sales DESC;
 
 ### 8.6 Lakehouse Federation
 
-Lets you query external operational databases (PostgreSQL, MySQL, Snowflake, Redshift, SQL Server, BigQuery, etc.) **directly through Unity Catalog** as if they were native tables, without an ETL copy step first.
+"Lakehouse Federation" is the umbrella name for **two distinct mechanisms** — a common point of confusion, and worth stating explicitly in an interview since they solve the same-sounding problem in fundamentally different ways.
+
+| | Query Federation | Catalog Federation |
+|---|---|---|
+| Target | Live relational databases (operational systems) | External **catalog services** managing open table formats in object storage |
+| Query execution | Pushed down via **JDBC**; runs partly on Databricks compute, partly on the **remote database's own compute** | Runs **entirely on Databricks compute** — reads the underlying files (Delta/Iceberg/etc.) directly from object storage |
+| Cost/performance | Depends on remote system's load/capacity | More cost-effective and performance-optimized — no remote engine dependency |
+| Supported sources | MySQL, PostgreSQL, Teradata, Oracle, Amazon Redshift, Snowflake, Microsoft SQL Server, Azure Synapse, Google BigQuery, Salesforce Data 360, another Databricks metastore | External Hive Metastore, AWS Glue, a legacy Databricks Hive Metastore, Snowflake (catalog), OneLake |
+| Best for | Ad hoc reporting / BI / proof-of-concept against operational data | Incremental migration to Unity Catalog, or a long-term hybrid model with data still cataloged externally |
+| Write support | Read-only in both | Read-only in both |
+
+**Query Federation** (the JDBC-pushdown kind — what most people mean by "Lakehouse Federation"):
 
 ```sql
 CREATE CONNECTION pg_connection TYPE POSTGRESQL
@@ -2590,16 +2629,35 @@ OPTIONS (host 'sqlserver.company.com', port '1433', user 'reader', password secr
 CREATE FOREIGN CATALOG sqlserver_catalog USING CONNECTION sqlserver_connection OPTIONS (database 'orders_db');
 ```
 
+**Catalog Federation** (the object-storage-direct kind — different `TYPE`, no remote query engine involved):
+
+```sql
+CREATE CONNECTION glue_connection TYPE HIVE_METASTORE
+OPTIONS (glueCatalogId 'aws-account-id', region 'us-east-1');
+
+CREATE FOREIGN CATALOG glue_catalog USING CONNECTION glue_connection;
+
+-- Reads the underlying files directly - no remote database engine is queried
+SELECT * FROM glue_catalog.legacy_schema.legacy_table LIMIT 10;
+```
+
 **The actual "federation query" scenario — joining foreign data with native Delta data in one query:**
 
 ```sql
 -- Enrich a live operational Postgres table with governed lakehouse dimension data,
 -- with no ETL pipeline built to copy either side first
 SELECT o.order_id, o.amount, d.customer_segment
-FROM pg_catalog.public.orders o                     -- foreign table (live Postgres)
+FROM pg_catalog.public.orders o                     -- foreign table (live Postgres, Query Federation)
 JOIN main.sales.dim_customer d                       -- native Delta table
   ON o.customer_id = d.customer_id
 WHERE o.order_date >= current_date() - INTERVAL 7 DAYS;
+
+-- UNION across a federated source, a Catalog-Federation source, and a native table in one statement
+SELECT * FROM pg_catalog.public.orders
+UNION ALL
+SELECT * FROM glue_catalog.legacy_schema.orders_archive
+UNION ALL
+SELECT * FROM main.sales.orders;
 ```
 
 ```python
@@ -2614,7 +2672,7 @@ df = spark.sql("""
 foreign_df = spark.table("pg_catalog.public.orders")
 ```
 
-**Verifying pushdown actually happened:**
+**Verifying pushdown actually happened (Query Federation only — Catalog Federation has no remote engine to push down to):**
 
 ```sql
 EXPLAIN SELECT * FROM pg_catalog.public.orders WHERE amount > 1000;
@@ -2623,9 +2681,12 @@ EXPLAIN SELECT * FROM pg_catalog.public.orders WHERE amount > 1000;
 -- applied AFTER the full table was pulled across
 ```
 
-**Interview answer:** *"The interesting case interviewers actually probe for isn't the single-table read — it's a query joining a foreign table to a native Delta table in one statement, because Unity Catalog governs both sides identically even though the data physically lives in two completely different systems. Pushdown is the other thing to call out explicitly: filters and aggregations get pushed into the source system's own query engine where possible, so `WHERE amount > 1000` runs inside Postgres, not after pulling the whole table across the network into Spark — but pushdown support varies by connector and by expression complexity, which is worth checking via `EXPLAIN` rather than assuming."*
+**Interview answer:** *"The interesting case interviewers actually probe for isn't the single-table read — it's a query joining a foreign table to a native Delta table in one statement, because Unity Catalog governs both sides identically even though the data physically lives in two completely different systems. Pushdown is the other thing to call out explicitly for Query Federation specifically: filters and aggregations get pushed into the source system's own query engine where possible. Catalog Federation doesn't have this distinction at all — since it reads object storage directly on Databricks compute, there's no remote engine to push anything down to, which is exactly why it tends to be cheaper and faster than Query Federation when the source data already sits in an open table format."*
 
-**Limitation worth stating:** Lakehouse Federation is fundamentally **read-only** — it's for querying external systems from the lakehouse, not for writing back to them. A workflow that needs to write to the external system needs its own JDBC write path or the external system's own tooling, not a federation connection.
+**Limitations worth stating:**
+- Both are fundamentally **read-only** — for a workflow that needs to write back to the external system, that needs its own JDBC write path or the source system's own tooling, not a federation connection.
+- **Query result caching (both Result Cache and Disk Cache) is not supported for federated queries** — every query re-executes against the source rather than reusing a cached result, which matters when estimating cost/latency for a federation-heavy dashboard.
+- Foreign catalog metadata is **synced into Unity Catalog on each interaction** — it isn't a one-time import, so schema changes on the source side are picked up automatically but do add a small sync overhead per access.
 
 ---
 
@@ -2777,16 +2838,29 @@ An **AI coding agent** embedded in Databricks notebooks for data science and eng
 
 ### 8.17 AI Runtime & Distributed Training
 
-**AI Runtime** provides **serverless GPU compute** for custom deep-learning training and inference, removing the need to manually provision/manage GPU clusters for these workloads. Complementary tools:
+**AI Runtime** provides **serverless GPU compute** for custom deep-learning training and inference, removing the need to manually provision/manage GPU clusters for these workloads.
 
 ```python
-# Distributed training approaches on Databricks (conceptual - library-specific APIs vary)
+# Serverless GPU API - launches distributed multi-GPU workloads directly from a notebook
+from serverless_gpu import distributed
+
+@distributed(gpus=8, gpu_type="H100")   # A10 or H100 accelerators; 8xH100 = one full node
+def run_train():
+    # standard PyTorch/HF training code here - runs once per GPU, environment auto-synced across all of them
+    ...
+
+run_train.distributed()
+```
+- Fully managed — no cluster sizing, driver selection, or autoscaling policy to configure; billed per-second like other serverless compute.
+- Typical use cases: LLM fine-tuning (LoRA/QLoRA/full fine-tune), computer vision, deep-learning recommender systems, reinforcement learning.
+- Complementary distributed-training tools that run **on top of** this compute layer:
+```python
 # - Ray on Databricks: general distributed compute framework for ML workloads
 # - TorchDistributor: distributes PyTorch training across a Spark cluster's workers
 # - DeepSpeed: memory-optimized distributed training for very large models
 ```
 
-**Interview answer:** *"AI Runtime is the serverless GPU layer — you get GPU compute without sizing/managing a GPU cluster yourself. Ray, TorchDistributor, and DeepSpeed are the distributed-training frameworks that actually parallelize a training job across that compute; AI Runtime is about *provisioning*, they're about *execution strategy*, and they're used together."*
+**Interview answer:** *"AI Runtime is the serverless GPU layer — you get GPU compute (A10 for lighter workloads, H100 for heavier/multi-node training) without sizing or managing a GPU cluster yourself, through a simple `@distributed` decorator. Ray, TorchDistributor, and DeepSpeed are the distributed-training frameworks that actually parallelize a training job across that compute; AI Runtime is about *provisioning*, they're about *execution strategy*, and they're used together."*
 
 ---
 
