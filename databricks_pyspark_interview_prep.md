@@ -477,6 +477,12 @@ df.count()            # subsequent actions use the checkpointed data, not the 20
 
 A very common practical/coding-round area: manipulating semi-structured data (arrays, structs, maps) and doing everyday string/date wrangling without dropping into UDFs.
 
+# PySpark: Nested Data Examples with Outputs
+
+Outputs are worked out by hand (Spark 3.x), not from a live run.
+
+## Setup
+
 ```python
 from pyspark.sql.functions import (
     explode, posexplode, col, struct, array, map_from_arrays,
@@ -487,23 +493,117 @@ from pyspark.sql.functions import (
 # Sample nested data
 data = [(1, "Alice", ["python", "sql"], {"city": "Pune", "zip": "411001"})]
 df = spark.createDataFrame(data, ["id", "name", "skills", "address"])
+```
 
-# explode array -> one row per element
+## 1. explode: one row per array element
+
+```python
 df.select("id", "name", explode("skills").alias("skill")).show()
+```
 
-# posexplode -> keep the position/index too
+```
++---+-----+------+
+| id| name| skill|
++---+-----+------+
+|  1|Alice|python|
+|  1|Alice|   sql|
++---+-----+------+
+```
+
+## 2. posexplode: keep the position/index too
+
+```python
 df.select("id", posexplode("skills").alias("pos", "skill")).show()
+```
 
-# Access map / struct fields
+```
++---+---+------+
+| id|pos| skill|
++---+---+------+
+|  1|  0|python|
+|  1|  1|   sql|
++---+---+------+
+```
+
+## 3. Access map / struct fields
+
+```python
 df.select(col("address")["city"].alias("city")).show()
+```
 
-# Build a struct column (grouping related fields)
+```
++----+
+|city|
++----+
+|Pune|
++----+
+```
+
+`address` is inferred as `map<string,string>`, so `["city"]` is a key lookup. Missing keys return `null`.
+
+## 4. Build a struct column
+
+```python
 df.withColumn("info", struct(col("name"), col("address")))
+```
 
-# Flatten a nested struct read from JSON
+`withColumn` is lazy and there's no action, so nothing prints. With `.show(truncate=False)`:
+
+```
++---+-----+-------------+-----------------------------+--------------------------------------+
+| id| name|       skills|                      address|                                  info|
++---+-----+-------------+-----------------------------+--------------------------------------+
+|  1|Alice|[python, sql]|{city -> Pune, zip -> 411001}|{Alice, {city -> Pune, zip -> 411001}}|
++---+-----+-------------+-----------------------------+--------------------------------------+
+```
+
+`printSchema()` output:
+
+```
+root
+ |-- id: long (nullable = true)
+ |-- name: string (nullable = true)
+ |-- skills: array (nullable = true)
+ |    |-- element: string (containsNull = true)
+ |-- address: map (nullable = true)
+ |    |-- key: string
+ |    |-- value: string (valueContainsNull = true)
+ |-- info: struct (nullable = false)
+ |    |-- name: string (nullable = true)
+ |    |-- address: map (nullable = true)
+ |    |    |-- key: string
+ |    |    |-- value: string (valueContainsNull = true)
+```
+
+## 5. Flatten a nested struct read from JSON
+
+```python
 json_df = spark.read.json("dbfs:/data/nested.json")   # e.g. column "user.address.city"
 flat_df = json_df.select("id", col("user.address.city").alias("city"))
+flat_df.show()
 ```
+
+If `nested.json` contains:
+
+```json
+{"id": 1, "user": {"name": "Alice", "address": {"city": "Pune", "zip": "411001"}}}
+```
+
+Output:
+
+```
++---+----+
+| id|city|
++---+----+
+|  1|Pune|
++---+----+
+```
+
+## Things to watch for
+
+- **Multiline JSON:** `spark.read.json` expects one JSON object per line by default. For pretty-printed or array-style files use `spark.read.option("multiLine", True).json(...)`.
+- **Empty or null arrays:** `explode` drops rows where the array is null or empty. Use `explode_outer` / `posexplode_outer` to keep them, with `null` in the exploded column.
+- **Unused imports:** `map_from_arrays`, `regexp_extract`, `collect_list`, and most of the others aren't used in this snippet.
 
 **String & date utilities frequently asked in coding rounds:**
 
