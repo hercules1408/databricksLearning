@@ -1720,29 +1720,43 @@ The checkpoint directory stores `offsets/` (what's been read), `commits/` (what'
 | **Triggered** | Runs once, processes all currently available data, then stops — cheaper, good for scheduled/batch-like pipelines |
 | **Continuous** | Keeps the pipeline's cluster running and processes new data as it arrives — lower latency, higher cost since compute never spins down |
 
-```python
-# Current API (recommended for new pipelines)
 from pyspark import pipelines as dp
-from pyspark.sql.functions import col
+from pyspark.sql.functions import col, to_date
 
+
+# STREAMING TABLE: the source is a streaming read (Auto Loader).
+# Each update processes only new files. Output is append-only.
 @dp.table(comment="Raw ingested events")
 def bronze_events():
-    return (spark.readStream.format("cloudFiles")
+    return (spark.readStream.format("cloudFiles")        # streaming read -> streaming table
             .option("cloudFiles.format", "json")
             .load("dbfs:/raw/events/"))
 
-@dp.materialized_view(comment="Cleaned, deduplicated events")     # was a plain @dlt.table before
-def silver_events():
-    return (dp.read("bronze_events")
-            .dropDuplicates(["event_id"])
-            .filter(col("event_time").isNotNull()))
 
+# MATERIALIZED VIEW: dp.read() is a BATCH read of the bronze streaming table.
+# Result is stored and refreshed incrementally where possible.
+@dp.materialized_view(comment="Cleaned, deduplicated events")
+def silver_events():
+    return (dp.read("bronze_events")                     # batch read of a streaming table is allowed
+            .dropDuplicates(["event_id"])
+            .filter(col("event_time").isNotNull())
+            .withColumn("event_date", to_date("event_time")))
+
+
+# MATERIALIZED VIEW reading another materialized view: batch read again.
+# dp.read_stream("silver_events") would fail here, since an MV can't be a streaming source.
 @dp.materialized_view(comment="Daily aggregated metrics")
 def gold_daily_metrics():
     return (dp.read("silver_events")
             .groupBy("event_date")
             .count())
-```
+
+
+# TEMPORARY VIEW: not stored, only usable inside this pipeline.
+# Good for intermediate logic you don't want to publish as a table.
+@dp.temporary_view(comment="Only valid events, not persisted")
+def valid_events():
+    return dp.read("bronze_events").filter(col("event_time").isNotNull())
 
 ```python
 # Legacy API (still fully supported, widely seen in existing pipelines/tutorials)
