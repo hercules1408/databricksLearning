@@ -1720,6 +1720,25 @@ The checkpoint directory stores `offsets/` (what's been read), `commits/` (what'
 | **Triggered** | Runs once, processes all currently available data, then stops — cheaper, good for scheduled/batch-like pipelines |
 | **Continuous** | Keeps the pipeline's cluster running and processes new data as it arrives — lower latency, higher cost since compute never spins down |
 
+# Lakeflow Declarative Pipelines: Streaming Table vs Materialized View vs View
+
+The read call you use decides whether a step is a streaming read or a batch read.
+
+## Which read to use
+
+| Source dataset type | How it's defined | Batch read | Streaming read |
+|---|---|---|---|
+| Streaming table | `@dp.table` returning a streaming DataFrame | `dp.read("name")` | `dp.read_stream("name")` |
+| Materialized view | `@dp.materialized_view` (or `@dp.table` returning a batch DataFrame) | `dp.read("name")` | Not supported (an MV can't be a streaming source) |
+| Temporary view | `@dp.temporary_view` | `dp.read("name")` | `dp.read_stream("name")` only if the view is built on a streaming query |
+
+The output type follows from the read and the decorator:
+- A **streaming read** (`readStream` or `dp.read_stream`) feeds a **streaming table**.
+- A **batch read** (`dp.read`) feeds a **materialized view**.
+
+## Example: bronze, silver, gold
+
+```python
 from pyspark import pipelines as dp
 from pyspark.sql.functions import col, to_date
 
@@ -1729,8 +1748,8 @@ from pyspark.sql.functions import col, to_date
 @dp.table(comment="Raw ingested events")
 def bronze_events():
     return (spark.readStream.format("cloudFiles")        # streaming read -> streaming table
-            .option("cloudFiles.format", "json")
-            .load("dbfs:/raw/events/"))
+            .option("cloudFiles.format", "json")         # source files are JSON
+            .load("dbfs:/raw/events/"))                  # landing folder for raw files
 
 
 # MATERIALIZED VIEW: dp.read() is a BATCH read of the bronze streaming table.
@@ -1738,9 +1757,9 @@ def bronze_events():
 @dp.materialized_view(comment="Cleaned, deduplicated events")
 def silver_events():
     return (dp.read("bronze_events")                     # batch read of a streaming table is allowed
-            .dropDuplicates(["event_id"])
-            .filter(col("event_time").isNotNull())
-            .withColumn("event_date", to_date("event_time")))
+            .dropDuplicates(["event_id"])                # keep one row per event_id
+            .filter(col("event_time").isNotNull())       # drop rows with no timestamp
+            .withColumn("event_date", to_date("event_time")))  # needed by the gold step
 
 
 # MATERIALIZED VIEW reading another materialized view: batch read again.
@@ -1748,8 +1767,8 @@ def silver_events():
 @dp.materialized_view(comment="Daily aggregated metrics")
 def gold_daily_metrics():
     return (dp.read("silver_events")
-            .groupBy("event_date")
-            .count())
+            .groupBy("event_date")                       # one row per day
+            .count())                                    # events per day
 
 
 # TEMPORARY VIEW: not stored, only usable inside this pipeline.
@@ -1757,6 +1776,9 @@ def gold_daily_metrics():
 @dp.temporary_view(comment="Only valid events, not persisted")
 def valid_events():
     return dp.read("bronze_events").filter(col("event_time").isNotNull())
+```
+
+## Streaming
 
 ```python
 # Legacy API (still fully supported, widely seen in existing pipelines/tutorials)
