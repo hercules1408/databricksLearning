@@ -1466,25 +1466,163 @@ df = (spark.readStream
 
 ### 4.4 State Management & Watermarking
 
+# 4.4 State Management & Watermarking
+
+## Key idea
+
+A **stateful** streaming query (aggregation, deduplication, stream-stream join) keeps intermediate data between micro-batches. Without limits, that state grows forever. **Watermarking** is how Spark knows when old state can be safely dropped.
+
+## Watermarking
+
 ```python
-from pyspark.sql.functions import window
+from pyspark.sql.functions import window, col
 
 events = spark.readStream.format("delta").table("bronze_events")
 
 agg = (events
        .withWatermark("event_time", "10 minutes")
        .groupBy(window("event_time", "5 minutes"), "device_id")
-       .count())
+       .count()
+       .select(col("window.start").alias("window_start"),
+               col("window.end").alias("window_end"),
+               "device_id", "count"))
 
-agg.writeStream.outputMode("update").format("delta") \
-   .option("checkpointLocation", "dbfs:/checkpoints/agg") \
-   .table("device_counts")
+(agg.writeStream
+    .outputMode("append")                      # Delta sink supports append / complete only
+    .option("checkpointLocation", "dbfs:/checkpoints/agg")
+    .toTable("device_counts"))
 ```
 
-- **Watermarking**: tells Spark "I won't wait for events more than 10 minutes late" — lets it safely drop old state and avoid unbounded memory growth.
-- **State Store backends**: default in-memory/HDFS-backed store vs **RocksDB StateStore** (recommended for large stateful streams — better memory efficiency, spills to local disk).
-- **Output modes**: `Append` (only final rows, no updates to previous output), `Update` (only changed rows), `Complete` (entire result table every trigger — only for aggregations).
+- **Watermark = max(event_time) seen so far - threshold** (here 10 minutes).
+- Events older than the watermark are **dropped** (late data is silently lost).
+- Window state older than the watermark is **deleted**, so memory stays bounded.
+- In `append` mode, a window is written **once**, after the watermark passes its end, so output is delayed.
+- Choose the threshold from how late data really arrives: bigger = fewer dropped events but more state and more delay.
 
+### Delta sink and `update` mode
+
+The Delta sink does **not** support `update` output mode. If you need evolving counts before a window closes, use `foreachBatch` with `MERGE`:
+
+```python
+from delta.tables import DeltaTable
+
+spark.sql("""
+    CREATE TABLE IF NOT EXISTS device_counts (
+        window_start TIMESTAMP,
+        window_end   TIMESTAMP,
+        device_id    STRING,
+        count        BIGINT
+    ) USING DELTA
+""")
+
+def upsert(batch_df, batch_id):
+    (DeltaTable.forName(spark, "device_counts").alias("t")
+        .merge(batch_df.alias("s"),
+               "t.window_start = s.window_start AND t.device_id = s.device_id")
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute())
+
+(agg.writeStream
+    .outputMode("update")
+    .foreachBatch(upsert)
+    .option("checkpointLocation", "dbfs:/checkpoints/agg")
+    .start())
+```
+
+## State store backends
+
+| Backend | Where state lives | Best for |
+|---|---|---|
+| Default (HDFS-backed) | Executor JVM memory, checkpointed to storage | Small or moderate state |
+| RocksDB | Off-heap and local disk, checkpointed to storage | Large state (millions of keys, long windows); avoids GC pauses and OOM |
+
+Enable RocksDB on Databricks:
+
+```python
+spark.conf.set(
+    "spark.sql.streaming.stateStore.providerClass",
+    "com.databricks.sql.streaming.state.RocksDBStateStoreProvider")
+```
+
+Open-source Spark 3.2+ uses `org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider`.
+
+## Output modes
+
+| Mode | What is written | Notes |
+|---|---|---|
+| `Append` | Only final rows, never updated later | With a watermarked aggregation, a window is emitted after the watermark passes its end |
+| `Update` | Only rows changed in this trigger | Not supported by the Delta sink (use `foreachBatch` + `MERGE`) |
+| `Complete` | Entire result table every trigger | Aggregations only; cannot drop old state, so state grows without bound; rarely right for production |
+
+## Checkpoint rules
+
+- The checkpoint stores source offsets and state. Use **one checkpoint location per query**.
+- Changing the aggregation, window size, or join logic usually needs a **new checkpoint**, because old state no longer matches.
+- Use `.trigger(availableNow=True)` for scheduled incremental runs instead of an always-on stream.
+
+---
+
+# Stream-Static and Stream-Stream Joins
+
+## Stream-static join
+
+A streaming DataFrame joined with a static (batch) table, typically a dimension table.
+
+```python
+devices = spark.read.table("dim_devices")   # static
+
+enriched = (spark.readStream.table("bronze_events")
+            .join(devices, "device_id", "left"))
+```
+
+- **Stateless**: no watermark needed.
+- Supported: inner and left outer with the stream on the left; right outer with the stream on the right.
+- With a Delta static table, each micro-batch reads the **latest table version**, so dimension updates are picked up.
+- Cheap; the standard pattern for enrichment.
+
+## Stream-stream join
+
+Both sides are streaming. Spark buffers rows from each side in state until a match arrives.
+
+```python
+from pyspark.sql.functions import expr
+
+impressions = (spark.readStream.table("bronze_impressions")
+               .withWatermark("imp_time", "10 minutes"))
+clicks = (spark.readStream.table("bronze_clicks")
+          .withWatermark("click_time", "20 minutes"))
+
+joined = impressions.join(
+    clicks,
+    expr("""
+        imp_ad_id = click_ad_id AND
+        click_time >= imp_time AND
+        click_time <= imp_time + interval 15 minutes
+    """),
+    "leftOuter")
+```
+
+- **Watermarks on both sides** plus a **time-range condition** tell Spark when a row can no longer match, so it can drop state.
+- Inner joins work without these, but state then grows forever.
+- Outer joins **require** both. Unmatched rows are emitted with nulls only after the watermark passes, so they arrive late.
+- Write the result in `append` mode.
+
+## Comparison
+
+| | Stream-static | Stream-stream |
+|---|---|---|
+| State | None | Buffered on both sides |
+| Watermark | Not needed | Needed to bound state; required for outer joins |
+| Typical use | Enrich events with a dimension table | Correlate two event streams |
+| Cost | Low | High; monitor state size |
+
+## Quick reminders
+
+- Late data past the watermark is dropped silently.
+- The `window` column is a struct (`start`, `end`); flatten it before writing.
+- Delta sink: `append` or `complete` only.
+- Prefer RocksDB for large state.
 **Stream-Static and Stream-Stream Joins**
 
 ```python
