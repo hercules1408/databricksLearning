@@ -607,6 +607,12 @@ Output:
 
 **String & date utilities frequently asked in coding rounds:**
 
+# PySpark: Dates, Regex, Pivot, and collect_list with Outputs
+
+Outputs are worked out by hand (Spark 3.x), not from a live run.
+
+## 1. Date and regex functions
+
 ```python
 df2 = spark.createDataFrame([("2024-01-15", "Order-1023-XL")], ["order_date", "sku"])
 
@@ -616,16 +622,90 @@ df2.select(
     regexp_extract(col("sku"), r"Order-(\d+)-", 1).alias("order_id"),
     regexp_replace(col("sku"), "-", "_").alias("sku_clean")
 ).show()
+```
 
-# Pivot / Unpivot
-sales = spark.createDataFrame([("A", "Jan", 100), ("A", "Feb", 150), ("B", "Jan", 200)],
-                               ["store", "month", "amount"])
+```
++----------+----------+--------+-------------+
+|        dt| dt_plus_7|order_id|    sku_clean|
++----------+----------+--------+-------------+
+|2024-01-15|2024-01-22|    1023|Order_1023_XL|
++----------+----------+--------+-------------+
+```
+
+- `to_date` parses the ISO string into a `date` type.
+- `date_add(..., 7)` adds 7 days.
+- `regexp_extract(..., 1)` returns capture group 1 as a string (`"1023"`, not an int). An unmatched pattern returns an empty string `""`, not `null`.
+- `regexp_replace` swaps every `-` for `_`.
+
+## 2. Pivot (long to wide)
+
+```python
+sales = spark.createDataFrame(
+    [("A", "Jan", 100), ("A", "Feb", 150), ("B", "Jan", 200)],
+    ["store", "month", "amount"]
+)
 sales.groupBy("store").pivot("month").sum("amount").show()   # wide format
+```
 
-# collect_list/collect_set - aggregate rows into an array per group
+```
++-----+----+---+
+|store| Feb|Jan|
++-----+----+---+
+|    A| 150|100|
+|    B|null|200|
++-----+----+---+
+```
+
+- Pivot columns come out **sorted alphabetically** (`Feb` before `Jan`), not in calendar order.
+- Store B has no Feb row, so that cell is `null`.
+- Row order after `groupBy` isn't guaranteed.
+- To control column order and skip the extra job Spark runs to discover distinct values, pass them explicitly: `.pivot("month", ["Jan", "Feb"])`.
+
+## 3. collect_list / collect_set
+
+```python
 df.groupBy("id").agg(collect_list("name").alias("names"))
 ```
 
+This is lazy (no action), so nothing prints. With `.show()`:
+
+```
++---+-------+
+| id|  names|
++---+-------+
+|  1|[Alice]|
++---+-------+
+```
+
+- `collect_list` keeps duplicates, and element order is not guaranteed.
+- `collect_set` removes duplicates, also with no guaranteed order.
+- This uses `df` from the earlier nested-data setup.
+
+## Unpivot (wide to long)
+
+The section header mentions unpivot but the snippet only pivots. On Spark 3.4+ you can reverse it:
+
+```python
+wide = sales.groupBy("store").pivot("month").sum("amount")
+wide.unpivot("store", ["Jan", "Feb"], "month", "amount").show()
+```
+
+```
++-----+-----+------+
+|store|month|amount|
++-----+-----+------+
+|    A|  Jan|   100|
+|    A|  Feb|   150|
+|    B|  Jan|   200|
+|    B|  Feb|  null|
++-----+-----+------+
+```
+
+On older versions, use `stack()` in `selectExpr`:
+
+```python
+wide.selectExpr("store", "stack(2, 'Jan', Jan, 'Feb', Feb) as (month, amount)")
+```
 ---
 
 ### 1.14 Bucketing
